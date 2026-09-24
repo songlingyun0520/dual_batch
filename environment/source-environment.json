@@ -1,0 +1,44 @@
+{
+  "observed_date": "2026-09-24",
+  "os": "openEuler 24.03 LTS-SP2",
+  "architecture": "aarch64",
+  "python": "3.11.6",
+  "device": "Ascend910B2",
+  "driver": "25.2.1",
+  "cann": "9.0.0",
+  "nnal_atb": "9.0.0",
+  "packages": {
+    "vllm": "0.18.0",
+    "vllm-ascend": "0.18.0",
+    "torch": "2.9.0",
+    "torch-npu": "2.9.0",
+    "transformers": "4.57.6",
+    "numpy": "1.26.4",
+    "setuptools": "68.0.0"
+  },
+  "torch_npu_git_version": "12d689a08941d4a6e45eab16e3ad6fef96a9affd",
+  "critical_installed_source_sha256": {
+    "vllm/model_executor/models/deepseek_v2.py": "bad4921f88f8343a965e333a399edf6b73f9d3031f6297e0dbf56afe37a31b01",
+    "vllm/model_executor/layers/fused_moe/unquantized_fused_moe_method.py": "ea94f562bd30316fc6db021acac15b19a5922dd68a7579f696c4ee96ed89addd",
+    "vllm_ascend/attention/sfa_v1.py": "63849e10e82f8bee4a9f0fb21ab0d606852cd6cf86a0a0fb983c8187980189a7",
+    "vllm_ascend/worker/model_runner_v1.py": "8d35f26a9db8f63038158c139a43f92e3e970117bb4a2b43c82fd828e349b981",
+    "vllm_ascend/ops/fused_moe/fused_moe.py": "bc170911dea7ff5c154ac966c9a046771f3afa79f0edd5e5d871525e911f25c0"
+  },
+  "original_demo_sha256": {
+    "demo_patch.py": "4341b532dfb081dafe98d272e2c6672982c62b50640605cd446df90d674088c9",
+    "dual_batch.py": "3575ca8e7c9d0ed9d2b05e88e4d9a746977622340ca85555e48c1e96686bec95",
+    "model/config.json": "fab03ebccafd23ef056bd0812575b38404b24f6d1b37b87e115609625cc365ba",
+    "model/tokenizer.json": "cd050be35cae877f8f0aa847f45aa87e23835a56ca32b29b28545597852784e5",
+    "model/tokenizer_config.json": "b5de6cc1c6758d02c0d3cec0efa062f1161654475458003f6f293f6ef28acdaa"
+  },
+  "note": "Observed source environment, not a complete binary lockfile; no original vLLM wheel source commit was available.",
+  "upstream_source_check": {
+    "date": "2026-09-24",
+    "refs": {
+      "vllm-project/vllm": "v0.18.0",
+      "vllm-project/vllm-ascend": "v0.18.0"
+    },
+    "all_five_critical_files_match": true,
+    "scope": "SHA-256 comparison of the five files listed above; not a complete wheel/binary comparison."
+  }
+}

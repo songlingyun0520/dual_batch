@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsv32-demo"
+version = "0.2.0"
+description = "Single-NPU DeepSeek V3.2 shape demo with decode micro-batch splitting"
+requires-python = ">=3.10,<3.12"
+
+[project.entry-points."vllm.general_plugins"]
+dsv32_demo = "demo_patch:register"
+
+[tool.setuptools]
+py-modules = ["demo_patch", "dual_batch"]
