@@ -1,0 +1,87 @@
+用途
+====
+在 enable_mlapo=false 的普通 DecodeOnly 路径，将 attention KV 写入、attention Q
+准备移动到 Lightning Indexer 之后、SFA 之前。保持整个 batch，不引入分组或新 stream。
+仅验证了源码语法和 CPU mock 控制流；没有在目标 16 卡 910C 上验证数值或图回放。
+
+修改前
+QKV/q_c/Indexer K -> attention KV/Q -> Indexer cache/Q/W -> LI -> SFA -> V -> O
+修改后
+QKV/q_c/Indexer K -> Indexer cache/Q/W -> LI -> attention KV/Q -> SFA -> V -> O
+
+使用方法（在实际运行 vLLM 的容器内，使用服务相同的 Python 环境）
+============================================================
+1. 将 patch_sfa_defer_attention.py 复制至容器 /workspace/。
+2. 查看差异（不会写入文件）：
+   python /workspace/patch_sfa_defer_attention.py
+3. 停止原服务，再应用：
+   python /workspace/patch_sfa_defer_attention.py --apply
+   也可显式指定 --source /实际安装目录/vllm_ascend/attention/sfa_v1.py。
+4. 给每个 worker 的启动环境设置：
+   export VLLM_ASCEND_SFA_DEFER_ATTN_PREP=1
+   原启动命令使用 --additional-config '{"enable_mlapo":false}'，保留原 FULL_DECODE_ONLY 配置。
+   若 additional-config 原来有其他字段，应保留其他字段，只改 enable_mlapo。
+5. 重启所有 rank 的进程并重新捕图。多容器、多节点必须使用相同源码与环境变量；
+   在入口 shell export 并不保证已有 Ray worker 或远端容器继承环境。
+   修改 Python 源码后通常无需重编译 CANN/C++ 算子。
+
+开关是本补丁新增的实验开关，不是官方内置参数。它在模块导入时读取，运行中不能切换。
+enable_mlapo 必须是 JSON false，不是字符串 "false"。
+补丁不会修改模型权重、cache 大小或专家数量。
+
+适用范围
+========
+已核对两个本地源码快照（名称不代表已确认目标 Docker 版本）：
+profile_snapshot SHA256:
+63849e10e82f8bee4a9f0fb21ab0d606852cd6cf86a0a0fb983c8187980189a7
+local_v023_snapshot SHA256:
+9f2a521f6eeca5b54f47de54129c6ce2c4ddf5d450e8ab10f111b86d0ba939d8
+
+文件哈希不符时拒绝修改，不要删除校验或直接整文件覆盖。
+应将目标容器实际 sfa_v1.py 取出，按对应版本重新适配。
+已装其他 dual-batch 补丁的文件也不匹配；这里没有合并 batch 拆分补丁。
+
+启用开关后，不支持的 decode 配置会报错：
+MLAPO、SFA prolog v3、DSA-CP/DCP、KV connector/producer、IndexCache/skip_topk、
+量化 sparse KV/indexer cache，以及 VLLM_ASCEND_SFA_DUAL_BATCH=1。
+这些限制是本实验补丁的支持范围，不代表那些模式在原理上绝对不能后移。
+W8A8 模型权重量化与 sparse KV/indexer cache 量化是不同设置。
+DP2/TP8 本身不能证明 CP 已关闭。
+
+不能移动的内容
+==============
+- fused_qkv_a_proj、q_c 的 q_a_layernorm：Indexer Q 还依赖 q_c。
+- Indexer K 的准备、Indexer cache 更新和 Indexer Q/W 准备：LI 需要这些输入。
+- wait_for_kv_layer_from_connector：保留原位置；不能认为它只保护 attention cache。
+原版 KV producer 的 ready event 假定 attention cache 已写好，因此本补丁拒绝 KV
+connector/producer，不让该事件在延后 KV 写入前被错误触发。
+DSA-CP 路径会联合处理 attention KV 和 Indexer K 通信，因此也不套用这个补丁。
+
+验证
+====
+1. 使用同样的输入、seed、生成长度，在开关关闭/开启时检查输出和错误日志；需要严格
+   验证时比较 logits/数值误差，单纯生成文本一致不充分证明所有路径都正确。
+2. 用原来 start_profile -> benchmark -> stop_profile 的流程采样预热后的 graph replay。
+3. 在同一 rank、同一 decode 层确认：
+   Indexer 的 cache ScatterNdUpdate 仍在 LightningIndexer 前；
+   attention 的 KvRmsNormRopeCache 和 Q 准备链移到 LightningIndexer 后、SFA 前。
+   不要仅按 MatMul 名字识别；结合 shape、上下游、stream ID。
+4. 检查各 rank，确认没有落入 prefill/eager、不同 rank 配置不一致或抓到旧进程。
+5. 比较完整层跨度、TPOT、LI end -> SFA start 的跨度。
+   Python 控制流测试不能保证编译/捕图后的设备执行顺序，最终以 profiler 为准。
+   不添加 torch.npu.synchronize() 强行排序，否则会改变实验时间与并发行为。
+
+原采样的 59.199 us 是旧顺序中该块的时间跨度，不是修改后保证不变的成本。
+后移只改变位置，不会自动省掉 59.199 us，也没有自动发起 miss KV 的异步传输。
+若以后实现 KV offload，需要另外实现 Indexer 结果就绪 -> 异步搬运 -> SFA 等待的依赖。
+
+回退
+====
+设置 VLLM_ASCEND_SFA_DEFER_ATTN_PREP=0 并重启所有 worker，可恢复原调用顺序。
+完整还原文件可将安装路径旁的 sfa_v1.py.before_defer_attention 复制回 sfa_v1.py，再重启。
+不要在服务仍运行时修改文件或仅重启部分 rank。
+
+控制流检查
+==========
+check_forward_order.py 依赖本机保存的两个原始源码快照，用 AST 提取真实 forward，mock
+NPU 操作，检查默认顺序、后移顺序、prefill/spec 路径和不支持配置的拒绝。它不测试硬件。
