@@ -1,0 +1,144 @@
+910C DeepSeek V3.2：双 batch + attention 准备后移（V3）
+====================================================
+适配基线：本目录 sfa_v1.upstream.py 的精确源码快照。
+“v023”是本地目录名；不保证任意同名 Docker tag 的源码都与本快照相同。
+验证状态：源码语法、补丁应用、312 组 CPU 参考 forward 对比通过。
+尚未在目标 16 卡 910C 上执行 CANN 数值验证或 ACL Graph 捕获/回放测试。
+
+一、原方案核对结论
+==================
+原 sfa_v1.py.patch 的基本分组方法合理：
+- 按 query/request 的 batch 维分组，两个组共享原物理 KV cache；
+- block_table 只切请求行，不能修改其中物理 block ID；
+- 第二组 cum_query_lens 减去第一组末尾 offset，方向正确；
+- 按 A/B 顺序合并 SFA 输出，再执行完整 batch 的 V/O，保持原 TP 通信边界。
+
+但原方案没有 attention 准备后移：所有 attention KV/Q 早已在两个 Indexer 前执行。
+原方案也不能直接叠加先前 defer-only 补丁：那个补丁会拒绝启用 dual-batch。
+V2 合并版完成了后移，但仍先做整 batch 前置准备；V3 按新的要求继续把前置准备拆开。
+原方案用长串条件静默回退；形状/配置不匹配时，看似开启但实际可能未拆分。
+seq_lens_cpu 非空不是本实验支持路径的设备 kernel 依赖，不应因此禁止拆分。
+旧方案没有目标 NPU 上的 padding、尾组全 padding、图 replay 验收证据。
+
+二、V3 的实际执行顺序
+====================
+batch A：融合 QKV / q_c 归一化 / Indexer K 准备 / A 的 Indexer cache 写入
+    -> Indexer A（包含 A 的 Indexer Q/W 准备）
+    -> batch B：融合 QKV / q_c 归一化 / Indexer K 准备 / B 的 Indexer cache 写入
+    -> Indexer B（包含 B 的 Indexer Q/W 准备）
+    -> 按 A/B 顺序拼接 q_c 与当前 token 的 KV 投影结果
+    -> 完整 batch：attention KV 写入 + attention Q 投影/BMM/RoPE
+    -> SFA A -> SFA B -> 按原请求顺序拼接
+    -> 完整 batch：V 上投影 -> O 投影及原有通信 -> 后续 MoE
+
+V3 按用户修正，把拆分点从 Indexer 前移到 QKV 投影前；A 的 Indexer 完成后才开始
+B 的 QKV 投影。不会先做整 batch 的 QKV/q_c/Indexer K，也不会预先写入 B 的 Indexer cache。
+若启用原有 SP，需要先完成输入 hidden_states 的 gather，再按请求维切分；该通信保留。
+拼接的是当前 token 的投影中间结果，不是历史 KV cache；拼接在两个 Indexer 后执行。
+相比 V2 增加两次中间结果拼接，QKV/归一化/Indexer K/cache 写入由一次变为两次。
+没有把两个 GPU/NPU stream 当作双 batch，也没有实现 miss KV 的异步 offload 搬运。
+图内这些调用按同一计算流顺序提交；实际设备执行顺序需通过 profiler 核对。
+图编译/算子内部实现可能改变最终表现，不以 Python 顺序替代设备时间线证据。
+
+在 DP2/TP8 中，每个 DP 副本对自己本次调度的 batch 拆分。全服务 8 条请求不必然
+在每个副本得到 4+4；假如两个副本各分到 4 条，则各自通常拆成 2+2。
+cut=(图容量+1)//2。真实 batch=8、图容量=8 时为 4+4；图容量=5 时为 3+2。
+图容量=1 时只有一组，但仍启用 attention 准备后移。
+
+三、图模式要求
+==============
+- enable_mlapo=false，普通 DecodeOnly，每请求每步一个 query token。
+- 使用 FULL_DECODE_ONLY；可用 NONE/eager 做对照。FULL 混合图不在支持范围。
+- 图分组由固定 tensor 形状/num_input_tokens 决定，不按实时 num_actual_tokens 分组。
+- seq_lens、block_table、slot_mapping 使用原 runner 的设备缓冲区切片。
+- 第二组累计长度的减法在设备上执行，可被捕获；不使用 .item()/.tolist()/CPU 同步。
+- padding 保留，不按 CPU 长度裁剪；例如容量8、实际3，仍运行4+4，第二组可能全 padding。
+- seq_lens_cpu 可以是 None。子 metadata 中 CPU 计数只是 capture 时的描述；本支持路径
+  的 kernel 只使用设备长度，不将这些 CPU 计数作为 replay 期间的有效请求数。
+- profiler 的 record_function 标签帮助查看 eager/capture，不能保证 replay 出现同名 CPU scope。
+
+代码在不支持的普通 decode 配置下报错，不静默回退：
+MLAPO、prolog v3、DSA-CP/DCP/PCP、KV connector/producer、IndexCache/skip_topk、
+sparse KV/indexer C8、C8 reshape 优化、MTP/speculative 配置及不匹配的 metadata 布局。
+Prefill/SpecDecoding 状态本身保持原流程；本次部署要求不配置 MTP。
+W8A8 模型权重量化与 sparse KV/indexer C8 是不同的设置；保留 W8A8。
+保留原 SP gather 位置，在 gather 之后切完整请求维，V/O 的原通信也保留。
+
+四、安装（停止所有 worker 后，在实际 vLLM 容器内）
+=================================================
+将本目录复制到 /workspace/sfa-dual-910c-v023，至少包含：
+  apply_combined_patch.py
+  sfa_v1.py
+
+用服务相同的 Python 环境执行：
+  python /workspace/sfa-dual-910c-v023/apply_combined_patch.py
+  python /workspace/sfa-dual-910c-v023/apply_combined_patch.py --apply
+
+可使用 --show-diff 查看变化；可用 --source /实际路径/sfa_v1.py 指定目标文件。
+安装器只接受本目录的原始快照、之前的 dual-only 版本、该快照的 defer-only V1 版本，以及之前的合并版 V2。
+未知哈希拒绝修改。不能移除校验或直接用整份文件覆盖其他 Docker 版本。
+这份 V3 是合并补丁，不要再应用两个旧补丁。
+自动备份文件为 sfa_v1.py.before_dual_defer_v3。
+多个容器/节点均需安装相同版本、设置相同环境，再重启全部 worker 重新捕图。
+
+五、启动
+========
+  export VLLM_ASCEND_SFA_DUAL_BATCH=1
+  export VLLM_ASCEND_SFA_DEFER_ATTN_PREP=1
+
+V3 中 dual=1 自动包含后移；推荐显式写出两个开关以便实验记录。
+开关在模块导入时读取。修改环境后必须重启服务，不能在已捕获图上热切换。
+保留原模型/TP8/DP2/W8A8/EP/内存等配置，参数包括：
+  --additional-config '{"enable_mlapo":false}'
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,8,12,16]}'
+
+FULL_DECODE_ONLY 的图容量不是用户请求数的保证；调度器会选择对应容量并 padding。
+在入口 shell export 不能保证已有 Ray/其他容器的 worker 自动继承，需设置到每个 worker。
+
+六、对照和设备验收
+==================
+三种实验模式（每次都重启所有 worker 并重新捕图）：
+  原始顺序：SFA_DUAL_BATCH=0，SFA_DEFER_ATTN_PREP=0
+  仅后移：  SFA_DUAL_BATCH=0，SFA_DEFER_ATTN_PREP=1
+  拆分后移：SFA_DUAL_BATCH=1，SFA_DEFER_ATTN_PREP=1
+上面为缩写；实际环境变量都带 VLLM_ASCEND_ 前缀。
+
+1. 固定模型、prompt、seed、temperature=0、输出长度；保存原始顺序的结果。
+2. 先 eager 对比完整输出、logprobs/可用 logits，检查有限性及数值差异。
+   小 batch matmul 可能换 kernel/舍入方式，不能预设逐位一致或固定误差阈值。
+3. 再用图模式重复测试多个步骤和不同内容的请求，确保不是只有 capture/warmup 成功。
+4. 验证容量4/8/12/16；实际请求数包含1、3、4、5、7、8，尤其检查尾组全 padding。
+   还需验证 warmup/dummy 的全 padding batch、并发请求结束后剩余单请求的情况。
+   CPU 模拟通过不证明 CANN 接受所有全 padding 子 batch；这一项必须实机验收。
+5. SP/EP/TP8/DP2 用真实部署配置测试全部 rank，不把单卡结果当作16卡结果。
+6. 预热后 start_profile -> benchmark -> stop_profile。支持布局且图容量>=2 的层应看到
+   A 的 QKV/q_c/Indexer K/cache 写入 -> LI A -> B 的对应准备 -> LI B ->
+   一次完整 batch attention KV/Q -> 两次 SFA -> 一次完整 batch V/O。
+   attention KV/Q 应在两个 LI 之后、两个 SFA 之前；不得出现 LI A 前完成 B 的 QKV。
+7. 比较每层完整时间跨度、TPOT、每组 LI end 到对应 SFA start 的跨度。不能把原来的
+   59.199 us 当作固定窗口或加速收益；拆分多了小 matmul、调度、连续化和拼接成本。
+8. 原 analyze_deepseek_decode_moe_v6_simplified.py 用单 Indexer/层锚点；双 Indexer 后
+   不能直接用原分类结果判断正确，需要另外适配分析器或按 kernel 时间线人工核对。
+
+七、回退
+========
+两开关均设为0并重启，可恢复原始 forward 顺序。
+完整还原安装前版本：将 sfa_v1.py.before_dual_defer_v3 复制回 sfa_v1.py，再重启。
+本地修改前的原 dual-only 文件另存为 sfa_v1.py.before_combined 和
+sfa_v1.py.patch.before_combined；上一版 V2 文件另存为 .before_v3。
+原始 sfa_v1.upstream.py 未修改。
+
+八、本地测试和依据
+==================
+  python test_combined_patch.py
+需要 NumPy。测试提取真实 forward/helper 函数，用 CPU reference Indexer/SFA 对比
+输出和物理 cache，覆盖312组前向用例，另检查开关、形状拒绝及 metadata 重定位。
+新增检查严格 P_A -> I_A -> P_B -> I_B 顺序、各次 QKV 的子 batch 大小，以及
+LI A 时 B 的当前 token Indexer cache 槽位仍未写入。
+它不导入 CANN、torch_npu 或真实模型，不能代替图模式硬件验证。
+
+核对过的官方参考（下载快照位于本地 audit_sources，打包交付不含这些大文件）：
+https://github.com/vllm-project/vllm-ascend/blob/v0.23.0/vllm_ascend/device/device_op.py
+https://github.com/vllm-project/vllm-ascend/blob/v0.23.0/vllm_ascend/worker/model_runner_v1.py
+重点：Indexer/SFA 使用独立 cache 与请求 block_table；FULL_DECODE_ONLY 的 uniform
+decode padding 按请求行扩展 query_start_loc。目标容器仍需使用自己的实际版本核对。

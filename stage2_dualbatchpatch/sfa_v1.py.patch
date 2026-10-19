@@ -1,0 +1,356 @@
+--- sfa_v1.upstream.py
++++ sfa_v1.py
+@@ -1,3 +1,6 @@
++# SFA_DUAL_BATCH_DEFER_PATCH_V3
++import copy
++import os as _sfa_reorder_os
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
+ 
+@@ -247,7 +250,57 @@
+     group_key_cache_idx: torch.Tensor | None = None
+ 
+ 
++_SFA_DUAL_BATCH = _sfa_reorder_os.environ.get("VLLM_ASCEND_SFA_DUAL_BATCH", "0") == "1"
++_SFA_DEFER_ATTN_PREP = (
++    _sfa_reorder_os.environ.get("VLLM_ASCEND_SFA_DEFER_ATTN_PREP", "0") == "1"
++    or _SFA_DUAL_BATCH
++)
++
+ M = TypeVar("M", bound=AscendSFAMetadata)
++
++
++def _slice_decode_metadata(md: M, lo: int, hi: int) -> M:
++    """Slice requests, retaining physical cache addresses and device metadata.
++
++    Only uniform, one-query-token-per-request DecodeOnly is supported. The
++    split is based on graph capacity, NEVER num_actual_tokens/seq_lens values.
++    CPU counts below are descriptive at capture time; kernels use device
++    seq_lens/cum_query_lens, which the runner updates before every replay.
++    """
++    group = copy.copy(md)
++    group.num_input_tokens = hi - lo
++    group.num_actual_tokens = max(0, min(md.num_actual_tokens - lo, hi - lo))
++    group.num_decodes = group.num_actual_tokens
++    group.num_decode_tokens = group.num_actual_tokens
++    group.num_prefills = 0
++    for name in ("slot_mapping", "seq_lens", "block_table", "cos", "sin"):
++        setattr(group, name, getattr(md, name)[lo:hi])
++    group.seq_lens_cpu = None if md.seq_lens_cpu is None else md.seq_lens_cpu[lo:hi]
++    offsets = md.cum_query_lens[lo:hi]
++    # NPU subtraction is captured and recomputed during replay; never .item().
++    group.cum_query_lens = offsets if lo == 0 else offsets - md.cum_query_lens[lo - 1]
++    return group
++
++
++def _validate_dual_decode_layout(md: M, hidden_states: torch.Tensor) -> None:
++    """Reject unsupported layouts explicitly instead of silently disabling split.
++
++    FULL_DECODE_ONLY uses padded request rows for padded query rows. FULL mixed
++    graphs may use one dummy request covering multiple query tokens and are not
++    supported here. Only tensor shapes are inspected; no device-to-host reads.
++    """
++    n = md.num_input_tokens
++    if n < 1:
++        raise RuntimeError("SFA dual decode requires positive graph capacity")
++    tensors = {"hidden_states": hidden_states}
++    for name in ("slot_mapping", "seq_lens", "cum_query_lens", "block_table", "cos", "sin"):
++        tensors[name] = getattr(md, name)
++    wrong = [name for name, tensor in tensors.items() if tensor.shape[0] != n]
++    if wrong:
++        raise RuntimeError(
++            "SFA dual decode requires one request row per query token, including graph padding; "
++            f"capacity={n}, mismatched tensors={wrong}. Use FULL_DECODE_ONLY without MTP/CP."
++        )
+ 
+ 
+ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
+@@ -1637,6 +1690,49 @@
+                         reach_layer_for_shard_weight_series(layer)
+             return output.fill_(0)
+ 
++        defer_attention_prepare = (
++            _SFA_DEFER_ATTN_PREP
++            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
++        )
++        if defer_attention_prepare:
++            unsupported = []
++            if self.enable_mlapo:
++                unsupported.append("enable_mlapo")
++            if self.enable_dsa_cp:
++                unsupported.append("DSA-CP")
++            if getattr(attn_metadata, "dcp_context", None) is not None:
++                unsupported.append("DCP")
++            if self.vllm_config.kv_transfer_config is not None or self.is_kv_producer:
++                unsupported.append("KV connector/producer")
++            if getattr(self, "enable_sfa_prolog_v3", False):
++                unsupported.append("SFA prolog v3")
++            if not getattr(self, "has_indexer", True):
++                unsupported.append("missing indexer")
++            if getattr(self, "skip_topk", False) or getattr(self, "use_index_cache", False):
++                unsupported.append("IndexCache/skip_topk")
++            if any(getattr(self, name, False) for name in (
++                "enable_sparse_sfa_c8", "enable_sparse_li_c8", "use_sparse_c8_indexer"
++            )):
++                unsupported.append("quantized sparse KV/indexer cache")
++            if get_ascend_config().c8_enable_reshape_optim:
++                unsupported.append("C8 reshape optimization")
++            if getattr(attn_metadata, "sfa_cp_metadata", None) is not None:
++                unsupported.append("prefill context parallel metadata")
++            parallel = self.vllm_config.parallel_config
++            if any(getattr(parallel, name, 1) != 1 for name in (
++                "decode_context_parallel_size", "prefill_context_parallel_size"
++            )):
++                unsupported.append("context parallel configuration")
++            if kv_cache is None:
++                unsupported.append("missing KV cache")
++            graph_mode = self.vllm_config.compilation_config.cudagraph_mode
++            if graph_mode.name not in {"NONE", "FULL_DECODE_ONLY"}:
++                unsupported.append("graph mode other than NONE/FULL_DECODE_ONLY")
++            if self.vllm_config.speculative_config is not None:
++                unsupported.append("speculative decoding/MTP configuration")
++            if unsupported:
++                raise RuntimeError("SFA attention-prep reorder does not support: " + ", ".join(unsupported))
++
+         cos = attn_metadata.cos
+         sin = attn_metadata.sin
+         slot_mapping = attn_metadata.slot_mapping
+@@ -1671,7 +1767,65 @@
+             AscendAttentionState.SpecDecoding,
+         }
+ 
+-        if self.enable_sfa_prolog_v3 and attn_metadata.attn_state in (
++        dual_decode = _SFA_DUAL_BATCH and defer_attention_prepare and num_input_tokens >= 2
++        if dual_decode:
++            # SP gathers the request dimension before slicing; no full-batch
++            # QKV/normalization/Indexer K computation is performed here.
++            if self.enable_sp:
++                hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
++                    hidden_states.contiguous(), need_gather_q_kv
++                )
++            _validate_dual_decode_layout(attn_metadata, hidden_states)
++            assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
++            assert self.q_a_layernorm is not None, "q_a_layernorm must be initialized"
++            wait_for_kv_layer_from_connector(layer_name)
++            weight_prefetch_method = get_weight_prefetch_method()
++            weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
++                inputs=self.fused_qkv_a_proj.weight, dependency=hidden_states
++            )
++            cut = (num_input_tokens + 1) // 2
++            halves = ((0, cut), (cut, num_input_tokens))
++            group_metadata = tuple(_slice_decode_metadata(attn_metadata, lo, hi) for lo, hi in halves)
++            group_topk = []
++            group_q_c = []
++            group_kv = []
++            for index, ((lo, hi), group) in enumerate(zip(halves, group_metadata)):
++                group_x = hidden_states[lo:hi]
++                with torch.profiler.record_function(f"sfa_dual.P{index}"):
++                    group_qkv = self.fused_qkv_a_proj(group_x)[0]
++                    q_c_part, kv_part = group_qkv.split(
++                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
++                    )
++                    q_c_part = self.q_a_layernorm(q_c_part)
++                    k_part, _ = self.indexer_select_pre_process(
++                        x=group_x, cos=group.cos, sin=group.sin
++                    )
++                    k_part = self._get_full_kv(k_part, group)
++                    # Only this group's Indexer slots are written. Attention KV
++                    # and the other group's current-token Indexer slots wait.
++                    torch_npu.npu_scatter_nd_update_(
++                        kv_cache[2].view(-1, k_part.shape[-1]),
++                        group.slot_mapping.view(-1, 1),
++                        k_part.view(-1, k_part.shape[-1]),
++                    )
++                with torch.profiler.record_function(f"sfa_dual.I{index}"):
++                    group_topk.append(
++                        self.indexer_select_post_process(
++                            x=group_x, q_c=q_c_part, kv_cache=kv_cache,
++                            attn_metadata=group, cos=group.cos, sin=group.sin,
++                            actual_seq_lengths_query=group.cum_query_lens,
++                            actual_seq_lengths_key=group.seq_lens,
++                        )
++                    )
++                group_q_c.append(q_c_part)
++                group_kv.append(kv_part)
++            # Merge AFTER I1, preserving request order. These are current-token
++            # projection results, not history-cache contents.
++            with torch.profiler.record_function("sfa_dual.merge_preparation"):
++                q_c = torch.cat(group_q_c, dim=0)
++                kv_no_split = torch.cat(group_kv, dim=0)
++            kv_slots = slot_mapping_sfa
++        elif self.enable_sfa_prolog_v3 and attn_metadata.attn_state in (
+             AscendAttentionState.DecodeOnly,
+             AscendAttentionState.SpecDecoding,
+         ):
+@@ -1758,26 +1912,27 @@
+                 kv_slots = slot_mapping_cp
+             else:
+                 kv_slots = slot_mapping_sfa
+-            kv_outputs = self.exec_kv(kv_no_split, cos, sin, kv_cache, kv_slots, attn_metadata)
+-            k_pe, k_nope = kv_outputs[:2]
+-            knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
+-
+-            if (
+-                self.enable_sparse_sfa_c8
+-                and not self.enable_dsa_cp
+-                and (get_ascend_device_type() != AscendDeviceType.A5 or not self.has_indexer)
+-            ):
+-                assert k_pe is not None
+-                assert k_nope is not None
+-                assert knope_scale is not None
+-                packed_kv = torch.cat([k_nope, k_pe, knope_scale], dim=-1)
+-                packed_head_dim = self.sfa_qsfa_packed_kv_head_dim
+-                assert packed_kv.shape[-1] == packed_head_dim
+-                torch_npu.npu_scatter_nd_update_(
+-                    kv_cache[0].view(-1, packed_head_dim),
+-                    slot_mapping_sfa.view(-1, 1),
+-                    packed_kv.view(-1, packed_head_dim),
+-                )
++            if not defer_attention_prepare:
++                kv_outputs = self.exec_kv(kv_no_split, cos, sin, kv_cache, kv_slots, attn_metadata)
++                k_pe, k_nope = kv_outputs[:2]
++                knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
++
++                if (
++                    self.enable_sparse_sfa_c8
++                    and not self.enable_dsa_cp
++                    and (get_ascend_device_type() != AscendDeviceType.A5 or not self.has_indexer)
++                ):
++                    assert k_pe is not None
++                    assert k_nope is not None
++                    assert knope_scale is not None
++                    packed_kv = torch.cat([k_nope, k_pe, knope_scale], dim=-1)
++                    packed_head_dim = self.sfa_qsfa_packed_kv_head_dim
++                    assert packed_kv.shape[-1] == packed_head_dim
++                    torch_npu.npu_scatter_nd_update_(
++                        kv_cache[0].view(-1, packed_head_dim),
++                        slot_mapping_sfa.view(-1, 1),
++                        packed_kv.view(-1, packed_head_dim),
++                    )
+ 
+             if self.enable_dsa_cp:
+                 assert k_pe is not None
+@@ -1818,9 +1973,10 @@
+                 if kv_ag_handle is not None:
+                     kv_ag_handles.append(kv_ag_handle)
+ 
+-            ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
+-            q_pe = self.rope_single(q_pe, cos, sin)
+-            self._record_dcp_query_gather_context(ql_nope, q_pe, attn_metadata)
++            if not defer_attention_prepare:
++                ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
++                q_pe = self.rope_single(q_pe, cos, sin)
++                self._record_dcp_query_gather_context(ql_nope, q_pe, attn_metadata)
+ 
+             if self.enable_dsa_cp:
+                 for kv_ag_handle in kv_ag_handles:
+@@ -1882,7 +2038,7 @@
+             # DCP's prefill path may all-gather only the blocks referenced by
+             # this batch. It must start after the current layer's SFA KV write,
+             # but before the indexer/top-k work so communication can overlap it.
+-            if kv_cache is not None:
++            if kv_cache is not None and not defer_attention_prepare:
+                 self._record_dcp_kv_gather_context(kv_cache, attn_metadata)
+ 
+             if self.has_indexer:
+@@ -1892,7 +2048,7 @@
+         if kv_cache is not None and self.is_kv_producer:
+             attn_metadata.reshape_cache_event = torch.npu.Event()
+ 
+-        if kv_cache is not None and self.has_indexer:
++        if not dual_decode and kv_cache is not None and self.has_indexer:
+             assert k_li is not None
+             if self.enable_sparse_sfa_c8:
+                 dsa_k_cache_idx = 1
+@@ -1943,34 +2099,64 @@
+             topk_num_tokens = attn_metadata.dsa_cp_context.local_end_with_pad - attn_metadata.dsa_cp_context.local_start
+         else:
+             topk_num_tokens = num_input_tokens or hidden_states.shape[0]
+-        if self.skip_topk:
+-            topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
++        if not dual_decode:
++            if _SFA_DUAL_BATCH and defer_attention_prepare:
++                # Capacity one keeps one group, with the same layout contract.
++                _validate_dual_decode_layout(attn_metadata, hidden_states)
++            if self.skip_topk:
++                topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
++            else:
++                if not self.has_indexer:
++                    raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
++                assert q_c is not None
++                topk_indices = self.indexer_select_post_process(
++                    x=hidden_states,
++                    q_c=q_c,
++                    kv_cache=kv_cache,
++                    attn_metadata=attn_metadata,
++                    cos=cos,
++                    sin=sin,
++                    actual_seq_lengths_query=actual_seq_lengths_query,
++                    actual_seq_lengths_key=actual_seq_lengths_key,
++                )
++                if self.use_index_cache:
++                    self._update_indexcache_topk_indices(topk_indices)
++
++        # Indexer has consumed its independent cache. Prepare SFA KV/Q now.
++        if defer_attention_prepare:
++            self.exec_kv(kv_no_split, cos, sin, kv_cache, kv_slots, attn_metadata)
++            ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
++            q_pe = self.rope_single(q_pe, cos, sin)
++            self._record_dcp_query_gather_context(ql_nope, q_pe, attn_metadata)
++            if kv_cache is not None:
++                self._record_dcp_kv_gather_context(kv_cache, attn_metadata)
++
++        if dual_decode:
++            # The original ql_nope is a transposed view. Make the full tensors
++            # contiguous once so each group is a contiguous batch slice.
++            ql_nope = ql_nope.contiguous()
++            q_pe = q_pe.contiguous()
++            group_outputs = []
++            for index, ((lo, hi), group, topk) in enumerate(zip(halves, group_metadata, group_topk)):
++                with torch.profiler.record_function(f"sfa_dual.A{index}"):
++                    group_outputs.append(
++                        self._execute_sparse_flash_attention_process(
++                            ql_nope[lo:hi], q_pe[lo:hi], kv_cache, topk, group,
++                            group.cum_query_lens, group.seq_lens,
++                        )
++                    )
++            # Restore the original request order before full-batch V/O and TP communication.
++            attn_output = torch.cat(group_outputs, dim=0)
+         else:
+-            if not self.has_indexer:
+-                raise RuntimeError(f"skip_topk is False but indexer is None. layer_name={self.layer_name}.")
+-            assert q_c is not None
+-            topk_indices = self.indexer_select_post_process(
+-                x=hidden_states,
+-                q_c=q_c,
+-                kv_cache=kv_cache,
+-                attn_metadata=attn_metadata,
+-                cos=cos,
+-                sin=sin,
+-                actual_seq_lengths_query=actual_seq_lengths_query,
+-                actual_seq_lengths_key=actual_seq_lengths_key,
+-            )
+-            if self.use_index_cache:
+-                self._update_indexcache_topk_indices(topk_indices)
+-
+-        attn_output = self._execute_sparse_flash_attention_process(
+-            ql_nope,
+-            q_pe,
+-            kv_cache,
+-            topk_indices,
+-            attn_metadata,
+-            actual_seq_lengths_query,
+-            actual_seq_lengths_key,
+-        )
++            attn_output = self._execute_sparse_flash_attention_process(
++                ql_nope,
++                q_pe,
++                kv_cache,
++                topk_indices,
++                attn_metadata,
++                actual_seq_lengths_query,
++                actual_seq_lengths_key,
++            )
+ 
+         attn_output = self._v_up_proj(attn_output)
+         weight_prefetch_method = get_weight_prefetch_method()

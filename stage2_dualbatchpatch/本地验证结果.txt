@@ -1,0 +1,19 @@
+V3 本地验证结果（2026-10-16）
+===========================
+PASS: 6 个 CPU 测试，含 312 组真实 forward 函数的参考对比。
+覆盖容量 1/2/3/4/5/7/8/12/16，实际请求数 0/1/半满/尾部 padding/满额。
+覆盖 CPU lengths 存在或 None、原始/仅后移/双 batch 模式。
+检查输出、物理 KV cache、请求行顺序和严格的前置准备 A -> LI A -> 前置准备 B -> LI B 顺序。
+检查 QKV 实际调用的子 batch 大小；attention KV/Q 仍只以完整 batch 调用一次。
+新增独立检查：LI A 时 A 的当前 Indexer cache 已写入、B 的当前槽位尚未写入。
+两个 Indexer 后拼接 q_c 与 KV 投影结果，后接完整 attention KV/Q、SFA A/B、拼接、V/O。
+Prefill/SpecDecoding 状态的原调用顺序保持；不支持配置和 metadata 形状显式拒绝。
+PASS: 原版、dual-only、defer-only、合并 V2 四种已知安装源的 dry-run/apply/backup/idempotence。
+PASS: 未知文件哈希拒绝修改。
+PASS: unified patch 应用到原版后，与交付 V3 sfa_v1.py 逐字节一致。
+PASS: Python 源码语法检查。
+
+未在目标 910C 验证：真实 W8A8/CANN 数值、16 卡通信、ACL Graph capture/replay、
+全 padding 子组的实际 kernel 行为、性能与 TPOT。
+CPU reference 使用 NumPy 替代设备算子，不是硬件模拟或真实模型推理。
+V3 的小 batch QKV 可能选择不同量化/MatMul kernel，真实数值和性能需重新测量。
