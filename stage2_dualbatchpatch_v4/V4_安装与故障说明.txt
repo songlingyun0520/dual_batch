@@ -1,0 +1,74 @@
+910C DeepSeek V3.2 双 batch 补丁 V4（2026-10-20）
+
+一、定位结果
+10-20 01:23:39，DP1 的 _validate_dual_decode_layout 抛出 RuntimeError。
+调度器记录7条请求，每条1个decode token，总计7；attention num_input_tokens=113。
+seq_lens/cum_query_lens/block_table 行数与113不符。V3错误地要求所有DecodeOnly
+执行都具有图捕获时的请求行布局。后续 EngineDeadError 和 Gloo 对端关闭是退出链路。
+图捕获先前已经完成，不能把此次错误判断为启动捕图失败。
+runner会在DP同步时扩展token输入；回落到非图执行时，请求metadata可保留紧凑布局。
+日志未给出DP0此步调度内容，因此不声称113具体由多少prefill/decode token构成。
+
+二、V4改动
+只在以下条件同时满足时，回到原始完整batch顺序（本步既不拆分，也不后移）：
+- dual开关开启，DecodeOnly，DP>1；
+- 请求metadata三者行数一致，实际token数<=请求行数<输入容量；
+- slot_mapping/cos/sin均覆盖完整输入容量；
+- forward context的运行时图模式是NONE。
+在任何QKV/cache计算前选定路径，保留所有输入padding、原metadata和物理cache位置。
+打印 SFA dual batch: DP token padding with compact request metadata ... 警告。
+这个回退仅处理非图执行的紧凑请求布局；正常FULL_DECODE_ONLY图保持V3的A/B顺序。
+若紧凑布局出现在FULL/PIECEWISE运行时，继续报错，不把错误布局捕获到图中。
+其他原有配置保护保留。没有实现KV offload或修改跨DP/TP/EP通信。
+
+正常双batch顺序：
+A QKV/q_c/Indexer K/cache -> LI A -> B QKV/q_c/Indexer K/cache -> LI B
+-> 合并当前token投影 -> 完整batch attention KV/Q准备 -> SFA A -> SFA B
+-> 合并输出 -> 完整batch V/O/通信 -> MoE。
+
+三、安装
+V3原文件和旧zip保留；本版本独立目录为sfa-dual-910c-v023-v4。
+推荐解压 V4_安装必需两文件.zip，将其中两个文件放到Docker内新目录：
+/workspace/sfa_patch_v4/apply_combined_patch.py
+/workspace/sfa_patch_v4/sfa_v1.py
+不要与旧安装器混用。安装器按相邻sfa_v1.py的SHA256校验。
+
+停止当前服务及所有worker，然后执行：
+cd /workspace/sfa_patch_v4
+python apply_combined_patch.py
+python apply_combined_patch.py --apply
+
+可以直接从V3升级；也支持已审计原版、dual-only、defer-only和V2。
+未知源码拒绝替换。默认dry run；--apply才会写入。
+备份为目标路径旁的sfa_v1.py.before_dual_defer_v4，不覆盖原V3备份。
+安装后输出New SHA256；重复安装相同版本不会改动文件。
+
+四、启动与复测
+原模型/TP8/DP2/EP/graph/profiler参数无需因本修复修改。继续使用：
+export VLLM_ASCEND_SFA_DUAL_BATCH=1
+export VLLM_ASCEND_SFA_DEFER_ATTN_PREP=1
+--additional-config '{"enable_mlapo":false}'
+--compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,8,12,16]}'
+必须重启全部worker重新捕图；不能热替换正在运行的进程。
+建议启动日志另存 /workspace/vllm_profile_v4_start.log，保留此次失败日志。
+先用原16并发/16k输入benchmark复测退出问题；需要固定30个输出token时加--ignore-eos。
+首次先确认服务能完成benchmark且健康，再执行start_profile -> benchmark -> stop_profile。
+看到compact metadata回退警告表示本次非图步骤使用完整batch，并不表示整个服务关闭图模式。
+稳定的uniform decode图仍应出现两个LI和两个SFA。不能仅凭启动成功宣称数值或性能通过。
+
+五、验证范围
+8个CPU测试通过，包括原312组forward参考对比，以及36组紧凑metadata回退对比。
+回退用例覆盖capacity=113/actual=7，以及零实际token、尾部dummy请求、CPU长度None。
+CPU参考中复现了V3的capacity=113校验失败，并确认V4回退输出/cache/调用顺序与原版一致。
+检查FULL/PIECEWISE紧凑布局继续拒绝，以及正常容量8实际7仍然双batch。
+安装器验证5种已知源码的dry run、替换、备份和重复安装；未知源码拒绝。
+原版->V4与V3->V4两种diff均精确复现交付源码。
+尚未在目标910C上实测V4。CPU测试不验证CANN kernel、W8A8数值、图回放或性能。
+V3原测试没有覆盖DP token padding与紧凑请求metadata组合，这是此次补上的回归用例。
+
+六、回退
+两环境变量均改为0并重启，恢复原始forward顺序。
+若需恢复安装前源码，用目标目录的sfa_v1.py.before_dual_defer_v4还原，再重启。
+
+V4 sfa_v1.py SHA256：
+cfc93fb978eac4eca5ab5a91a3a04c9981e3ec55e8c944e428ad64742accb68d

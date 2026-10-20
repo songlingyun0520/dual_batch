@@ -1,0 +1,74 @@
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -1,4 +1,4 @@
+-# SFA_DUAL_BATCH_DEFER_PATCH_V3
++# SFA_DUAL_BATCH_DEFER_PATCH_V4
+ import copy
+ import os as _sfa_reorder_os
+ from dataclasses import dataclass
+@@ -9,7 +9,8 @@
+ import torch_npu
+ import vllm.envs as envs_vllm
+ from torch import nn
+-from vllm.config import VllmConfig, get_current_vllm_config
++from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
++from vllm.forward_context import get_forward_context
+ from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+ from vllm.logger import logger
+ from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
+@@ -282,6 +283,25 @@
+     return group
+ 
+ 
++def _is_compact_dp_decode_layout(md: M) -> bool:
++    """Recognize token padding with compact, internally consistent request rows.
++
++    DP coordination may enlarge num_input_tokens while this DP still has only
++    one query per real request. When dispatch falls back to NONE, the runner
++    keeps request metadata compact. Such a step must use the original unsplit
++    path. This predicate reads host counts/shapes only, never device values.
++    """
++    n = md.num_input_tokens
++    rows = md.seq_lens.shape[0]
++    return (
++        0 <= md.num_actual_tokens <= rows < n
++        and md.cum_query_lens.shape[0] == rows
++        and md.block_table.shape[0] == rows
++        and all(getattr(md, name).shape[0] == n
++                for name in ("slot_mapping", "cos", "sin"))
++    )
++
++
+ def _validate_dual_decode_layout(md: M, hidden_states: torch.Tensor) -> None:
+     """Reject unsupported layouts explicitly instead of silently disabling split.
+ 
+@@ -1732,6 +1752,29 @@
+                 unsupported.append("speculative decoding/MTP configuration")
+             if unsupported:
+                 raise RuntimeError("SFA attention-prep reorder does not support: " + ", ".join(unsupported))
++
++        if (_SFA_DUAL_BATCH and defer_attention_prepare
++                and getattr(self.vllm_config.parallel_config, "data_parallel_size", 1) > 1
++                and _is_compact_dp_decode_layout(attn_metadata)):
++            runtime_mode = get_forward_context().cudagraph_runtime_mode
++            if runtime_mode != CUDAGraphMode.NONE:
++                raise RuntimeError(
++                    "SFA dual decode compact request metadata is only supported by "
++                    "the original path with runtime graph mode NONE; "
++                    f"runtime_mode={runtime_mode}, capacity={attn_metadata.num_input_tokens}, "
++                    f"request_rows={attn_metadata.seq_lens.shape[0]}"
++                )
++            # Disable both modifications BEFORE QKV/cache writes. Keep all token
++            # padding and the original metadata/cache intact for TP/EP collectives.
++            # Uniform graph capture/replay still uses the V3 A -> B schedule.
++            logger.warning_once(
++                "SFA dual batch: DP token padding with compact request metadata; "
++                "using original unsplit attention order for this non-graph step "
++                "(capacity=%d, actual_tokens=%d, request_rows=%d).",
++                attn_metadata.num_input_tokens, attn_metadata.num_actual_tokens,
++                attn_metadata.seq_lens.shape[0],
++            )
++            defer_attention_prepare = False
+ 
+         cos = attn_metadata.cos
+         sin = attn_metadata.sin

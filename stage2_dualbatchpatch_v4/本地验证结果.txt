@@ -1,0 +1,10 @@
+V4 本地验证（2026-10-20）
+PASS 8 tests; 312 original forward/reference comparisons.
+PASS 36 compact DP layout fallback comparisons against original (output/cache/call order).
+PASS reproduced original V3 capacity=113 guard exception.
+PASS compact metadata rejected for FULL/PIECEWISE runtime; uniform FULL split preserved.
+PASS syntax compile for source, installer, and tests.
+PASS installer dry run/apply/backup/idempotence for all 5 known inputs.
+PASS unknown installed source rejected unchanged.
+PASS original->V4 and V3->V4 patches reproduce identical bytes.
+No target NPU/CANN/ACL Graph V4 execution performed.
