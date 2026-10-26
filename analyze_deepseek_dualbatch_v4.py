@@ -352,8 +352,23 @@ def load_kernels(path, device=None, separator="auto"):
                for r in data.itertuples()]
     data = data.loc[~np.asarray(shadows)].sort_values(["start", "source_row"]).reset_index(drop=True)
     data["kernel_id"] = np.arange(len(data))
-    if data.stage.eq("MLA_Preprocess").any():
-        raise ValueError("MLA_Preprocess found: this analyzer requires enable_mlapo=false.")
+    fused = data[data.stage.eq("MLA_Preprocess")]
+    if not fused.empty:
+        examples = "\n".join(
+            f"  source_row={r.source_row}, device={r.device}, name={r.name!r}, "
+            f"input_shapes={r.input_shapes!r}"
+            for r in fused.head(5).itertuples()
+        )
+        raise ValueError(
+            "Unsupported MLA_Preprocess records detected; this analyzer expects the "
+            "unfused enable_mlapo=false layout.\n"
+            f"Input file: {Path(path).resolve()}\n"
+            f"Matching records: {len(fused)}; first {min(5, len(fused))}:\n{examples}\n"
+            "Check the actual input file and these kernel names before changing settings. "
+            "This name match alone does not prove the current server configuration; "
+            "the file may belong to another run or contain mixed captures. "
+            "Do not remove these records to force an analysis."
+        )
     return data, {"input": str(Path(path).resolve()), "timestamp_origin_us": str(origin),
                   "headerless": headerless, "delimiter": repr(sep),
                   "invalid_rows_dropped": dropped_invalid, "duplicate_rows_dropped": before-len(data),
@@ -781,9 +796,92 @@ def layer_record(layer, rows, modules):
     for j,tag in enumerate(("A","B")):
         record[f"indexer_{tag}_end_to_sfa_{tag}_start_us"] = (
             float(sfa.iloc[j].start-li.iloc[j].end) if len(li)==len(sfa)==2 else np.nan)
+    # Disjoint phase boundaries: dual preparation is two separate intervals.
+    phase_fields = ("pre_indexer_wall_us", "lightning_indexer_wall_us", "sfa_path_wall_us",
+                    "output_path_wall_us", "pre_indexer_A_wall_us", "pre_indexer_B_wall_us",
+                    "attention_prepare_wall_us", "post_indexer_attention_prepare_wall_us",
+                    "indexer_to_sfa_gap_us", "sfa_kernel_us", "sfa_envelope_us")
+    record.update({key: np.nan for key in phase_fields})
+    valid = (start is not None and layer["moe_start"] is not None and len(li) in (1, 2)
+             and len(li) == len(sfa) and float(li.end.max()) <= float(sfa.start.min()) + EPS
+             and float(sfa.end.max()) <= layer["moe_start"] + EPS)
+    if valid and len(li) == 2:
+        valid = float(li.iloc[0].end) <= float(li.iloc[1].start) + EPS
+    record["phase_boundaries_valid"] = bool(valid)
+    if valid:
+        pre_a = float(li.iloc[0].start) - start
+        pre_b = float(li.iloc[1].start-li.iloc[0].end) if len(li) == 2 else 0.0
+        record.update(pre_indexer_wall_us=pre_a+pre_b,
+                      pre_indexer_A_wall_us=pre_a,
+                      pre_indexer_B_wall_us=pre_b if len(li) == 2 else np.nan,
+                      lightning_indexer_wall_us=float(li.duration_us.sum()),
+                      sfa_path_wall_us=float(sfa.end.max()-li.end.max()),
+                      output_path_wall_us=layer["moe_start"]-float(sfa.end.max()),
+                      indexer_to_sfa_gap_us=float(sfa.start.min()-li.end.max()),
+                      sfa_kernel_us=float(sfa.duration_us.sum()),
+                      sfa_envelope_us=float(sfa.end.max()-sfa.start.min()))
+        prep = next((m for m in modules if m["module"] == "attention_kv_q"), None)
+        if prep:
+            record["attention_prepare_wall_us"] = prep["span_us"]
+            if prep["start_us"] >= float(li.end.max()) - EPS:
+                record["post_indexer_attention_prepare_wall_us"] = prep["span_us"]
+        if end is not None:
+            total = sum(record[key] for key in ("pre_indexer_wall_us", "lightning_indexer_wall_us",
+                                                "sfa_path_wall_us", "output_path_wall_us", "moe_wall_us"))
+            if abs(total-record["layer_wall_us"]) > 1e-5:
+                raise ValueError(f"Layer {layer['layer_uid']} phase wall sum mismatch")
     # These are dependency windows in the observed compute schedule, NOT a
     # measured amount of KV transfer overlap or guaranteed hidden latency.
     return record
+
+
+def format_decode_summary(forward, summary_df, moe_count):
+    """Console/file summary, keeping different graph capacities separate."""
+    candidates = forward.complete & forward.phase.isin(["decode_candidate", "decode_dual_schedule"])
+    lines = ["", "================ Decode Summary ================",
+             f"Decode candidates (incl. long tail): {int(candidates.sum())}",
+             f"Stable complete steps             : {int(forward.stable_decode.sum())}",
+             f"Stable regimes                    : {len(summary_df)}"]
+    if summary_df.empty:
+        lines.append("No stable complete decode: summary/TPOT unavailable.")
+        return "\n".join(lines)
+    def value(v, unit="us"):
+        return f"{v / (1000 if unit == 'ms' else 1):.3f} {unit}" if pd.notna(v) else "N/A"
+    for r in summary_df.to_dict("records"):
+        lines += ["", f"--- regime {int(r['regime_id'])}: {r['layout']}, shape={r['shape_signature']} ---",
+                  f"Stable complete steps         : {r['stable_steps']}",
+                  f"{moe_count}-MoE wall mean              : {value(r['moe_layers_wall_us_mean'], 'ms')}",
+                  f"Profiler TPOT mean            : {value(r['profiler_tpot_us_mean'], 'ms')}",
+                  f"Profiler TPOT pairs           : {r['profiler_tpot_pairs']}"]
+        for key in ("layer_wall_us", "pre_indexer_wall_us", "lightning_indexer_wall_us",
+                    "sfa_path_wall_us", "output_path_wall_us", "moe_wall_us"):
+            lines.append(f"{key:39s}: {value(r[key+'_mean'])}")
+        lines += [f"Phase boundary samples: {r['phase_boundary_samples']}/{r['layer_samples']}",
+                  "pre_indexer_wall_us = layer start -> Indexer A start + Indexer A end -> Indexer B start (dual).",
+                  "lightning_indexer_wall_us = sum of Indexer kernel durations (A+B for dual).",
+                  "sfa_path_wall_us = last Indexer end -> last SFA end; includes deferred KV/Q and merges if present.",
+                  "output_path_wall_us = last SFA end -> MoE input norm start.",
+                  "Preparation position (layer samples): "
+                  f"before_indexer={r['prepare_before_indexer_samples']}, "
+                  f"after_indexer={r['prepare_after_indexer_samples']}, "
+                  f"unknown_position={r['prepare_unknown_samples']}",
+                  "Nested diagnostics (do not add to layer wall):"]
+        for key in ("pre_indexer_A_wall_us", "pre_indexer_B_wall_us",
+                    "indexer_A_span_us", "indexer_B_span_us",
+                    "attention_prepare_wall_us", "post_indexer_attention_prepare_wall_us",
+                    "indexer_to_sfa_gap_us", "sfa_kernel_us", "sfa_envelope_us"):
+            lines.append(f"  {key:43s}: {value(r[key+'_mean'])}")
+        lines.append("sfa_kernel_us = sum of SFA kernel durations; sfa_envelope_us includes gaps between A/B SFA.")
+        lines.append("Observed module means (span / kernel_sum; non-additive):")
+        for key, label in LABELS.items():
+            span = r.get(key+"_span_us_mean", np.nan)
+            if pd.notna(span):
+                lines.append(f"  {label}: {value(span)} / {value(r[key+'_kernel_sum_us_mean'])}")
+        if r['estimated_layer_ends']:
+            lines.append(f"Layer {r['last_moe_layer']} full-layer and MoE times include an estimated terminal gap "
+                         f"({r['estimated_layer_ends']} layer samples); TPOT uses start timestamps.")
+    lines.append("Units: wall/span/kernel_sum are us; TPOT and whole-forward wall above are ms.")
+    return "\n".join(lines)
 
 
 def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58,
@@ -856,16 +954,21 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     for regime,g in per_step.groupby("regime_id"):
         summary=dict(regime_id=regime,layout=g.layout.iloc[0],shape_signature=g.shape_signature.iloc[0],
                      stable_steps=len(g),moe_layers=moe_count,
-                     moe_wall_us_mean=g.moe_layers_wall_us.mean(),
+                     moe_layers_wall_us_mean=g.moe_layers_wall_us.mean(),
                      profiler_tpot_us_mean=g.profiler_tpot_us.mean(),
                      profiler_tpot_pairs=int(g.profiler_tpot_us.notna().sum()),
                      estimated_layer_ends=int(g.estimated_layer_ends.sum()))
         sg=stable[stable.regime_id==regime]
+        summary.update(layer_samples=len(sg), last_moe_layer=first_moe+moe_count-1,
+                       phase_boundary_samples=int(sg.phase_boundaries_valid.sum()),
+                       prepare_before_indexer_samples=int(sg.prep_location.eq("before_indexer").sum()),
+                       prepare_after_indexer_samples=int(sg.prep_location.eq("after_indexers").sum()),
+                       prepare_unknown_samples=int(sg.prep_location.eq("unknown").sum()))
         for metric in metrics:
             summary[metric+"_mean"]=sg[metric].mean()
         summaries.append(summary)
     summary_df=pd.DataFrame(summaries) if summaries else pd.DataFrame(columns=[
-        "regime_id","layout","stable_steps","moe_wall_us_mean","profiler_tpot_us_mean"])
+        "regime_id","layout","stable_steps","moe_layers_wall_us_mean","profiler_tpot_us_mean"])
     # Choose an actual stable sample; for excerpts choose the best visible body.
     target=None
     ids=stable.step_id.drop_duplicates().sort_values().tolist()
@@ -904,7 +1007,7 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     for name,frame in tables.items():
         frame.to_csv(out/name,index=False,float_format="%.6f",encoding="utf-8-sig")
     manifest.update(
-        analyzer="dualbatch_v4.1", script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        analyzer="dualbatch_v4.3", script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         indexer_shape_parse_failures=int((~shape_diagnostics.parse_ok).sum()),
         layers_detected=len(layers),
         forward_groups_detected=len(steps),complete_forwards=int(forward.complete.sum()),
@@ -929,6 +1032,10 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
         print("Complete forward phases:", forward.loc[forward.complete, "phase"].value_counts().to_dict())
     if not shape_diagnostics.parse_ok.all():
         print("[WARN] Indexer shape parsing failed; inspect indexer_shape_diagnostics.csv.")
+    summary_text = format_decode_summary(forward, summary_df, moe_count)
+    print(summary_text)
+    (out/"decode_summary.txt").write_text(summary_text+"\n", encoding="utf-8")
+    print("\n========= Selected layer: observed order =========")
     print(f"Selected layer_uid={target}, origin={selected_kernels.relative_origin.iloc[0]}")
     for r in selected_modules.itertuples():
         print(f"{r.module_name:36s} span={r.span_us:10.3f} us; kernel_sum={r.kernel_sum_us:10.3f} us [{r.status}]")

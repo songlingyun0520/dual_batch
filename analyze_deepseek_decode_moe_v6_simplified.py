@@ -1,8 +1,9 @@
 """Analyze one rank's kernel_details.csv with enable_mlapo disabled.
 
 The additive layer wall-time partition is: attention-layer start -> Indexer
-start (all preceding Q/KV/Indexer preparation), Indexer kernel, Indexer end
--> SFA end (layout + sparse attention), SFA end -> MoE norm start (V up,
+start (all preceding preparation), Indexer kernel, Indexer end
+-> SFA end (including deferred attention KV/Q, if present, plus layout and
+sparse attention), SFA end -> MoE norm start (V up,
 O projection and communication), then MoE norm start -> next layer start.
 The O quantization/matmul span is also reported separately inside the output
 path. All times are device timeline wall spans, not sums of kernel durations.
@@ -11,10 +12,21 @@ decode_original_order_timeline.csv additionally reports each stable decode
 layer in the observed kernel order, with separate preparation, Indexer,
 SFA, V/O, communication and MoE spans. A missing anchor stays unresolved;
 it is never filled with a duration inferred from a neighboring layer.
+The historical "original_order" filenames now describe the OBSERVED order
+for both before-Indexer and after-Indexer attention preparation. Preparation
+spans are diagnostics nested in the additive partition, not extra summands.
+
+Capacity-aware revision: safe Indexer Q/block-table shape parsing, per-contiguous-
+capacity regime detection and statistics, no TPOT across regimes or missing steps.
+Capacity means execution rows (possibly graph padding), not live request count.
+Single-token prefill can share decode shapes; shape classification is heuristic.
+
 """
 
 import argparse
 import os
+import re
+import json
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 
@@ -31,6 +43,10 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--csv", default="kernel_details.csv", help="kernel_details.csv path")
 parser.add_argument("--output-dir", default="deepseek_decode_no_mlapo_analysis")
 parser.add_argument("--debug", action="store_true", help="Also write per-step/layer timing detail")
+parser.add_argument(
+    "--expect-attention-prep", choices=["auto", "before", "after"], default="auto",
+    help="Auto-detect KV/Q preparation position; warn if it differs from this expectation",
+)
 args = parser.parse_args()
 CSV_PATH = args.csv
 OUTPUT_DIR = args.output_dir
@@ -86,7 +102,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # 1. Read CSV + detect columns
 # ============================================================
 
-df = pd.read_csv(CSV_PATH)
+# Preserve the original timestamp text even when CSV fields have no embedded
+# quote characters. Parsing a ~1e15-us epoch into float before Decimal would
+# already lose sub-microsecond precision and can invent boundary overlaps.
+df = pd.read_csv(CSV_PATH, dtype=str)
 device_col = next((c for c in df.columns if str(c).lower() in {"device_id", "device id"}), None)
 if device_col is not None and df[device_col].nunique(dropna=True) > 1:
     raise ValueError("CSV 含多个 Device_id；请先按单个 device/rank 拆分，避免交错层时间线。")
@@ -204,6 +223,14 @@ def classify(name):
         return "Combine"
 
     # Communication
+    # AI-CPU collective kernels are background/runtime tasks on another stream.
+    # Their lifetime is not the corresponding HCCL operation's wall span.
+    # Keep them visible, but never attribute them to O communication or remap.
+    compact = n.replace("_", "")
+    if "aicpu" in compact and any(
+        op in compact for op in ("allreduce", "allgather", "reducescatter", "alltoall")
+    ):
+        return "CommunicationRuntime"
     if "allgather" in n:
         return "AllGather"
     if "allreduce" in n:
@@ -306,6 +333,22 @@ def next_after(values, t):
     if pos >= len(values):
         return None
     return float(values[pos])
+
+
+def find_attention_starts(indexer_starts, norm_starts):
+    """Last norm between consecutive Indexers is the attention-layer start.
+
+    Preserve NaN for a clipped first layer; never substitute the first kernel
+    in a pasted fragment as its layer start.
+    """
+    result = []
+    for i, indexer_start in enumerate(indexer_starts):
+        previous_indexer = indexer_starts[i - 1] if i else -np.inf
+        candidates = norm_starts[
+            (norm_starts > previous_indexer) & (norm_starts < indexer_start)
+        ]
+        result.append(float(candidates[-1]) if len(candidates) else np.nan)
+    return np.asarray(result, dtype=float)
 
 
 def robust_mode_int(values):
@@ -511,14 +554,7 @@ indexer_starts = indexer_rows_all["start"].to_numpy(dtype=float)
 norm_starts = norm_rows_all["start"].to_numpy(dtype=float)
 # The last AddRmsNormBias before each Indexer is the attention-side layer
 # start. The earlier AddRmsNormBias between two Indexers belongs to MoE.
-attention_starts = []
-for i, indexer_start in enumerate(indexer_starts):
-    previous_indexer = indexer_starts[i - 1] if i else -np.inf
-    candidates = norm_starts[
-        (norm_starts > previous_indexer) & (norm_starts < indexer_start)
-    ]
-    attention_starts.append(float(candidates[-1]) if len(candidates) else np.nan)
-attention_starts = np.asarray(attention_starts, dtype=float)
+attention_starts = find_attention_starts(indexer_starts, norm_starts)
 if np.isnan(attention_starts).any():
     print(f"[WARN] {np.isnan(attention_starts).sum()} 个 Indexer 缺少前置 AddRmsNormBias；相关 forward 会被丢弃。")
 attention_starts = np.unique(attention_starts[np.isfinite(attention_starts)])
@@ -542,7 +578,7 @@ for k, start_idx in enumerate(boundary_indices):
     grp = gating_rows.iloc[start_idx:end_idx].copy()
 
     if len(grp) == NUM_MOE_LAYERS:
-        step_groups.append(grp)
+        step_groups.append((k, grp))
     else:
         print(
             f"[WARN] 丢弃不完整/异常 forward: gating_count={len(grp)}, "
@@ -568,7 +604,7 @@ print(f"Detected complete forward steps: {len(step_groups)}")
 step_records = []
 moe_layer_records = []
 
-for raw_step_id, grp in enumerate(step_groups):
+for raw_step_id, grp in step_groups:
     grp = grp.sort_values("start").reset_index(drop=True)
     if len(grp) != NUM_MOE_LAYERS:
         continue
@@ -829,125 +865,222 @@ step_summary["next_step_interval_us"] = (
 #        Therefore a real Decode long-tail is preserved rather than filtered.
 # ============================================================
 
-step_summary["step_kind"] = "other"
-step_summary["decode_detection_method"] = ""
+def shape_list(value):
+    """Parse CANN shapes, including literal quoting left by CSV/Excel exports.
 
-n_steps = len(step_summary)
-tail_n = min(TAIL_REFERENCE_STEPS, n_steps)
-tail = step_summary.tail(tail_n).copy()
+    Preserve empty argument slots; never eval text or extract arbitrary digits.
+    """
+    def unquote(text):
+        text = text.strip()
+        while len(text) >= 2 and text[0] in (chr(34), chr(39)) and text[-1] == text[0]:
+            text = text[1:-1].strip()
+        return text
+    result = []
+    for part in unquote(str(value)).split(";"):
+        part = unquote(part)
+        if len(part) >= 2 and (part[0], part[-1]) in (("[", "]"), ("(", ")")):
+            part = part[1:-1].strip()
+        if re.fullmatch(r"\d+(?:\s*,\s*\d+)*", part):
+            result.append(tuple(int(x) for x in part.split(",")))
+        else:
+            result.append(())
+    return result
 
-# ---------- A. Stable kernel-structure reference ----------
-ref_kernel_count = robust_mode_int(tail["moe58_kernel_count"].tolist())
-if pd.isna(ref_kernel_count):
-    raise RuntimeError("无法建立 Decode kernel-count 尾部参考。")
+def detect_capacity_regime(step_summary):
+    print(f"Capacity regime {int(step_summary.iloc[0].regime_id)}: {int(step_summary.iloc[0].input_capacity)} tokens, {len(step_summary)} candidate steps")
+    step_summary["step_kind"] = "other"
+    step_summary["decode_detection_method"] = ""
 
-kernel_count_tol = max(
-    int(KERNEL_COUNT_ABS_TOL),
-    int(np.ceil(float(ref_kernel_count) * KERNEL_COUNT_REL_TOL)),
-)
+    n_steps = len(step_summary)
+    tail_n = min(TAIL_REFERENCE_STEPS, n_steps)
+    tail = step_summary.tail(tail_n).copy()
 
-critical_cols = [
-    "gating_count",
-    "dispatch_count",
-    "expert_gemm1_count",
-    "expert_gemm2_count",
-    "combine_count",
-]
-critical_refs = {c: robust_mode_int(tail[c].tolist()) for c in critical_cols}
+    # ---------- A. Stable kernel-structure reference ----------
+    ref_kernel_count = robust_mode_int(tail["moe58_kernel_count"].tolist())
+    if pd.isna(ref_kernel_count):
+        raise RuntimeError("无法建立 Decode kernel-count 尾部参考。")
 
-step_summary["decode_ref_kernel_count"] = int(ref_kernel_count)
-step_summary["kernel_count_delta"] = (
-    step_summary["moe58_kernel_count"] - int(ref_kernel_count)
-).abs()
-step_summary["kernel_structure_ok"] = (
-    step_summary["kernel_count_delta"] <= kernel_count_tol
-)
-
-for c in critical_cols:
-    ref = critical_refs[c]
-    if not pd.isna(ref):
-        step_summary["kernel_structure_ok"] &= (step_summary[c] == int(ref))
-
-# ---------- B. Locate the final pure-Decode latency plateau ----------
-plateau = find_decode_plateau_start(
-    walls=step_summary["moe58_wall_us"].to_numpy(dtype=float),
-    structure_ok=step_summary["kernel_structure_ok"].to_numpy(dtype=bool),
-    tail_reference_steps=TAIL_REFERENCE_STEPS,
-    min_decode_steps=MIN_DECODE_STEPS,
-    min_rel_tol=PLATEAU_MIN_REL_TOL,
-    mad_mult=PLATEAU_MAD_MULT,
-    min_abs_tol_us=PLATEAU_MIN_ABS_TOL_US,
-    confirm_window=PLATEAU_CONFIRM_WINDOW,
-    confirm_inlier_frac=PLATEAU_CONFIRM_INLIER_FRAC,
-)
-
-ref_wall_us = float(plateau["ref_wall_us"])
-wall_tol_us = float(plateau["tol_us"])
-wall_tol_rel = float(plateau["tol_rel"])
-
-step_summary["decode_plateau_ref_wall_us"] = ref_wall_us
-step_summary["decode_plateau_tol_us"] = wall_tol_us
-step_summary["decode_plateau_tol_rel"] = wall_tol_rel
-step_summary["wall_plateau_inlier"] = plateau["inlier_mask"]
-step_summary["wall_ratio_to_decode_tail"] = (
-    step_summary["moe58_wall_us"] / ref_wall_us
-    if np.isfinite(ref_wall_us) and ref_wall_us > 0
-    else np.nan
-)
-step_summary["wall_time_sanity_ok"] = (
-    (step_summary["wall_ratio_to_decode_tail"] >= WALL_DIAGNOSTIC_RATIO_LOW)
-    & (step_summary["wall_ratio_to_decode_tail"] <= WALL_DIAGNOSTIC_RATIO_HIGH)
-)
-step_summary["decode_plateau_start"] = False
-step_summary["decode_after_plateau_start"] = False
-
-plateau_start = plateau["start_idx"]
-if plateau_start is None:
-    print("\n[WARN] 没有可靠识别到 pure-Decode latency plateau。")
-    print("       请检查 all_forward_steps.csv 中 wall/kernel structure。")
-else:
-    plateau_start = int(plateau_start)
-    step_summary.loc[plateau_start, "decode_plateau_start"] = True
-    step_summary.loc[plateau_start:, "decode_after_plateau_start"] = True
-
-    # ---------- C. Keep all structural matches after onset ----------
-    # Do NOT filter by wall time here: this intentionally preserves true
-    # long-tail Decode steps.
-    decode_mask = (
-        step_summary.index.to_numpy() >= plateau_start
-    ) & step_summary["kernel_structure_ok"].to_numpy(dtype=bool)
-
-    method = (
-        "final_decode_plateau("
-        f"start_step={int(step_summary.loc[plateau_start, 'step_id'])},"
-        f"ref_wall_us={ref_wall_us:.3f},"
-        f"tol_us={wall_tol_us:.3f},"
-        f"tol_rel={wall_tol_rel:.4f},"
-        f"confidence={plateau['confidence']};"
-        f"ref_kernels={int(ref_kernel_count)},kernel_tol={kernel_count_tol})"
+    kernel_count_tol = max(
+        int(KERNEL_COUNT_ABS_TOL),
+        int(np.ceil(float(ref_kernel_count) * KERNEL_COUNT_REL_TOL)),
     )
 
-    step_summary.loc[decode_mask, "step_kind"] = "decode"
-    step_summary.loc[decode_mask, "decode_detection_method"] = method
+    critical_cols = [
+        "gating_count",
+        "dispatch_count",
+        "expert_gemm1_count",
+        "expert_gemm2_count",
+        "combine_count",
+    ]
+    critical_refs = {c: robust_mode_int(tail[c].tolist()) for c in critical_cols}
 
-    # Structural mismatch after plateau onset is suspicious and is deliberately
-    # not labelled Decode; surface it loudly for manual inspection.
-    post_onset_bad = step_summary.loc[plateau_start:, "kernel_structure_ok"] == False
-    if post_onset_bad.any():
-        bad_ids = step_summary.loc[
-            step_summary.index[plateau_start:][post_onset_bad.to_numpy()], "step_id"
-        ].tolist()
-        print(
-            f"[WARN] plateau起点之后存在 kernel structure 不匹配 step: {bad_ids}; "
-            "这些step未纳入Decode统计。"
+    step_summary["decode_ref_kernel_count"] = int(ref_kernel_count)
+    step_summary["kernel_count_delta"] = (
+        step_summary["moe58_kernel_count"] - int(ref_kernel_count)
+    ).abs()
+    step_summary["kernel_structure_ok"] = (
+        step_summary["kernel_count_delta"] <= kernel_count_tol
+    )
+
+    for c in critical_cols:
+        ref = critical_refs[c]
+        if not pd.isna(ref):
+            step_summary["kernel_structure_ok"] &= (step_summary[c] == int(ref))
+
+    # ---------- B. Locate the final pure-Decode latency plateau ----------
+    plateau = find_decode_plateau_start(
+        walls=step_summary["moe58_wall_us"].to_numpy(dtype=float),
+        structure_ok=step_summary["kernel_structure_ok"].to_numpy(dtype=bool),
+        tail_reference_steps=TAIL_REFERENCE_STEPS,
+        min_decode_steps=MIN_DECODE_STEPS,
+        min_rel_tol=PLATEAU_MIN_REL_TOL,
+        mad_mult=PLATEAU_MAD_MULT,
+        min_abs_tol_us=PLATEAU_MIN_ABS_TOL_US,
+        confirm_window=PLATEAU_CONFIRM_WINDOW,
+        confirm_inlier_frac=PLATEAU_CONFIRM_INLIER_FRAC,
+    )
+
+    ref_wall_us = float(plateau["ref_wall_us"])
+    wall_tol_us = float(plateau["tol_us"])
+    wall_tol_rel = float(plateau["tol_rel"])
+
+    step_summary["decode_plateau_ref_wall_us"] = ref_wall_us
+    step_summary["decode_plateau_tol_us"] = wall_tol_us
+    step_summary["decode_plateau_tol_rel"] = wall_tol_rel
+    step_summary["wall_plateau_inlier"] = plateau["inlier_mask"]
+    step_summary["wall_ratio_to_decode_tail"] = (
+        step_summary["moe58_wall_us"] / ref_wall_us
+        if np.isfinite(ref_wall_us) and ref_wall_us > 0
+        else np.nan
+    )
+    step_summary["wall_time_sanity_ok"] = (
+        (step_summary["wall_ratio_to_decode_tail"] >= WALL_DIAGNOSTIC_RATIO_LOW)
+        & (step_summary["wall_ratio_to_decode_tail"] <= WALL_DIAGNOSTIC_RATIO_HIGH)
+    )
+    step_summary["decode_plateau_start"] = False
+    step_summary["decode_after_plateau_start"] = False
+
+    plateau_start = plateau["start_idx"]
+    if plateau_start is None:
+        print("\n[WARN] 没有可靠识别到 pure-Decode latency plateau。")
+        print("       请检查 forward_classification.csv 中 wall/kernel structure。")
+    else:
+        plateau_start = int(plateau_start)
+        step_summary.loc[plateau_start, "decode_plateau_start"] = True
+        step_summary.loc[plateau_start:, "decode_after_plateau_start"] = True
+
+        # ---------- C. Keep all structural matches after onset ----------
+        # Do NOT filter by wall time here: this intentionally preserves true
+        # long-tail Decode steps.
+        decode_mask = (
+            step_summary.index.to_numpy() >= plateau_start
+        ) & step_summary["kernel_structure_ok"].to_numpy(dtype=bool)
+
+        method = (
+            "final_decode_plateau("
+            f"start_step={int(step_summary.loc[plateau_start, 'step_id'])},"
+            f"ref_wall_us={ref_wall_us:.3f},"
+            f"tol_us={wall_tol_us:.3f},"
+            f"tol_rel={wall_tol_rel:.4f},"
+            f"confidence={plateau['confidence']};"
+            f"ref_kernels={int(ref_kernel_count)},kernel_tol={kernel_count_tol})"
         )
+
+        step_summary.loc[decode_mask, "step_kind"] = "decode"
+        step_summary.loc[decode_mask, "decode_detection_method"] = method
+
+        # Structural mismatch after plateau onset is suspicious and is deliberately
+        # not labelled Decode; surface it loudly for manual inspection.
+        post_onset_bad = step_summary.loc[plateau_start:, "kernel_structure_ok"] == False
+        if post_onset_bad.any():
+            bad_ids = step_summary.loc[
+                step_summary.index[plateau_start:][post_onset_bad.to_numpy()], "step_id"
+            ].tolist()
+            print(
+                f"[WARN] plateau起点之后存在 kernel structure 不匹配 step: {bad_ids}; "
+                "这些step未纳入Decode统计。"
+            )
+
+    return step_summary
+
+# Extract all 58 observed Indexer shapes; capacity is NOT live request count.
+shape_diagnostics = []
+layer_shapes = {}
+li_data = data[data.stage == "LightningIndexer"].sort_values("start")
+li_times = li_data.start.to_numpy()
+for layer in moe_layer_summary.itertuples():
+    part = li_data.iloc[np.searchsorted(li_times, layer.start):np.searchsorted(li_times, layer.gating_start)]
+    capacities, requests = [], []
+    for row in part.itertuples():
+        shapes = shape_list(row.input_shapes)
+        q = shapes[0][0] if shapes and shapes[0] else None
+        req = shapes[5][0] if len(shapes)>5 and shapes[5] else None
+        capacities.append(q)
+        requests.append(req)
+        shape_diagnostics.append(dict(step_id=layer.step_id, model_layer=layer.model_layer,
+            input_shapes_repr=repr(row.input_shapes), parsed_shapes=json.dumps(shapes),
+            q_tokens=q, request_rows=req, parse_ok=q is not None and req is not None))
+    if len(part) != 1:
+        phase = "unsupported_indexer_count"
+    elif capacities[0] is None or requests[0] is None or min(capacities[0], requests[0]) <= 0:
+        phase = "unknown_shape"
+    elif capacities != requests:
+        phase = "prefill_or_dp_padding"
+    else:
+        phase = "decode_candidate"
+    layer_shapes[(layer.step_id,layer.model_layer)] = (capacities, requests, phase)
+shape_diagnostics = pd.DataFrame(shape_diagnostics)
+if not shape_diagnostics.empty:
+    failures=int((~shape_diagnostics.parse_ok).sum())
+    print(f"Indexer shape parse failures: {failures}/{len(shape_diagnostics)}")
+step_summary["input_capacity"] = np.nan
+step_summary["shape_signature"] = ""
+step_summary["shape_phase"] = "unknown_shape"
+for idx, row in step_summary.iterrows():
+    items=[layer_shapes[(row.step_id, layer)] for layer in range(FIRST_MOE_LAYER,LAST_MOE_LAYER+1)]
+    signatures=sorted({tuple(x[0]) for x in items},key=str)
+    step_summary.at[idx,"shape_signature"] = str(signatures)
+    phases={x[2] for x in items}
+    if phases == {"decode_candidate"} and len(signatures)==1:
+        step_summary.at[idx,"input_capacity"] = signatures[0][0]
+        step_summary.at[idx,"shape_phase"] = "decode_candidate"
+    elif "prefill_or_dp_padding" in phases:
+        step_summary.at[idx,"shape_phase"] = "prefill_or_dp_padding"
+    elif phases == {"decode_candidate"}:
+        step_summary.at[idx,"shape_phase"] = "mixed_capacity"
+    elif "unsupported_indexer_count" in phases:
+        step_summary.at[idx,"shape_phase"] = "unsupported_indexer_count"
+
+# Same capacity reappearing later forms a NEW regime. Missing raw steps break it.
+step_summary["regime_id"] = np.nan
+regime=-1
+previous=None
+for idx,row in step_summary.iterrows():
+    if row.shape_phase != "decode_candidate":
+        previous=None
+        continue
+    if previous is None or previous[0] != row.input_capacity or previous[1]+1 != row.raw_step_id:
+        regime+=1
+    step_summary.at[idx,"regime_id"]=regime
+    previous=(row.input_capacity,row.raw_step_id)
+step_summary["step_kind"]="other"
+step_summary["decode_detection_method"]="shape_not_decode_candidate"
+for key in ("kernel_structure_ok","wall_plateau_inlier","decode_plateau_start","decode_after_plateau_start"):
+    step_summary[key]=False
+for key in ("kernel_count_delta","wall_ratio_to_decode_tail"):
+    step_summary[key]=np.nan
+classified=[]
+for _,group in step_summary[step_summary.regime_id.notna()].groupby("regime_id",sort=False):
+    classified.append(detect_capacity_regime(group.copy().reset_index(drop=True)))
+classified.append(step_summary[step_summary.regime_id.isna()])
+step_summary=pd.concat(classified,ignore_index=True).sort_values("step_id").reset_index(drop=True)
 
 # Merge step labels back to layers.
 moe_layer_summary = moe_layer_summary.merge(
     step_summary[
         [
             "step_id",
-            "step_kind",
+            "step_kind", "regime_id", "input_capacity", "shape_signature", "shape_phase",
             "decode_detection_method",
             "moe58_wall_us",
             "next_step_interval_us",
@@ -970,9 +1103,13 @@ moe_layer_summary = moe_layer_summary.merge(
 # ============================================================
 
 step_summary["prev_step_id"] = step_summary["step_id"].shift(1)
-step_summary["profiler_tpot_from_prev_us"] = (
-    step_summary["moe58_start"] - step_summary["moe58_start"].shift(1)
+same_regime_pair = (
+    step_summary.regime_id.notna() & step_summary.regime_id.eq(step_summary.regime_id.shift(1))
+    & step_summary.input_capacity.eq(step_summary.input_capacity.shift(1))
+    & step_summary.raw_step_id.eq(step_summary.raw_step_id.shift(1)+1)
+    & step_summary.step_kind.eq("decode") & step_summary.step_kind.shift(1).eq("decode")
 )
+step_summary["profiler_tpot_from_prev_us"] = step_summary.moe58_start.diff().where(same_regime_pair)
 
 
 # ============================================================
@@ -1099,7 +1236,10 @@ def measure_layer(layer):
     return {
         "step_id": step_id,
         "model_layer": model_layer,
-        "stable_decode_step": bool(layer["wall_plateau_inlier"]),
+        "stable_decode_step": layer.get("step_kind", "decode" if layer.get("wall_plateau_inlier", False) else "other") == "decode",
+        "regime_id": layer.get("regime_id", np.nan),
+        "input_capacity": layer.get("input_capacity", np.nan),
+        "shape_signature": layer.get("shape_signature", ""),
         "anchors_ok": anchor_ok,
         "anchor_error": reason,
         "layer_end_estimated": not bool(layer["layer_end_measured"]),
@@ -1194,64 +1334,134 @@ def original_order_for_layer(layer):
     compute_stream = indexer["stream"]
     compute = ld[ld["stream"] == compute_stream].sort_values("start").reset_index(drop=True)
 
-    # Both 910C W8A8 and 910B BF16 native traces put Cast, Slice immediately
-    # before KvRmsNormRopeCache. The first following ScatterNdUpdate starts
-    # Indexer's own cache write and Q/W preparation.
+    # Native preparation has its own cache and does not have to precede LI.
+    # Locate the KV anchor across streams, then inspect its own stream for
+    # Cast/Slice and attention Q's final InterleaveRope. Do not infer an absent
+    # block's cost from the old trace or from the entire LI->SFA interval.
     pre = compute[compute["start"] < indexer_start].reset_index(drop=True)
-    kv_positions = pre.index[
-        pre["name"].str.contains("kvrmsnormropecache", case=False, na=False)
-    ].tolist()
-    if len(kv_positions) == 1:
-        kv_pos = kv_positions[0]
-        scatter_positions = pre.index[
-            (pre.index > kv_pos)
-            & pre["name"].str.contains("scatterndupdate", case=False, na=False)
-        ].tolist()
+    attention_rows = ld[ld["start"] < sfa_start].sort_values("start")
+    kv_rows = attention_rows[
+        attention_rows["name"].str.contains("kvrmsnormropecache", case=False, na=False)
+    ]
+    prep_location = "unknown"
+    movable_kernel_ids = set()
+    if len(kv_rows) == 1:
+        kv_row = kv_rows.iloc[0]
+        if kv_row["start"] < indexer_start:
+            prep_location = "before_indexer"
+        elif kv_row["start"] >= indexer_end - 1e-6:
+            prep_location = "after_indexer"
+        kv_stream = attention_rows[attention_rows["stream"] == kv_row["stream"]]
+        kv_positions = np.flatnonzero(kv_stream.index == kv_row.name)
+        kv_pos = int(kv_positions[0])
         cast_slice = (
             kv_pos >= 2
-            and "cast" in pre.iloc[kv_pos - 2]["name"].lower()
-            and "slice" in pre.iloc[kv_pos - 1]["name"].lower()
+            and "cast" in kv_stream.iloc[kv_pos - 2]["name"].lower()
+            and "slice" in kv_stream.iloc[kv_pos - 1]["name"].lower()
         )
-        if cast_slice and scatter_positions:
+        if cast_slice:
             movable_pos = kv_pos - 2
-            scatter_pos = scatter_positions[0]
-            if 0 < movable_pos < scatter_pos < len(pre):
-                set_stage(
-                    "required_qkv_indexer_k", layer_start, pre.iloc[movable_pos - 1]["end"],
-                    f"layer start -> {pre.iloc[movable_pos - 1]['name']}",
-                )
-                set_stage(
-                    "movable_attention_kv_q", pre.iloc[movable_pos]["start"],
-                    pre.iloc[scatter_pos - 1]["end"],
-                    "Cast + Slice + KvRmsNormRopeCache -> before Indexer ScatterNdUpdate",
-                )
-                set_stage(
-                    "required_indexer_cache_qw", pre.iloc[scatter_pos]["start"],
-                    pre.iloc[-1]["end"],
-                    "Indexer ScatterNdUpdate -> last compute kernel before LightningIndexer",
-                )
+            if prep_location == "before_indexer" and kv_row["stream"] == compute_stream:
+                scatter_positions = [
+                    i for i in range(kv_pos + 1, len(kv_stream))
+                    if kv_stream.iloc[i]["start"] < indexer_start
+                    and "scatterndupdate" in kv_stream.iloc[i]["name"].lower()
+                ]
+                if scatter_positions:
+                    scatter_pos = scatter_positions[0]
+                    block = kv_stream.iloc[movable_pos:scatter_pos]
+                    if movable_pos > 0 and not block.empty:
+                        movable_kernel_ids.update(block.index)
+                        set_stage(
+                            "required_qkv_indexer_k", layer_start,
+                            kv_stream.iloc[movable_pos - 1]["end"],
+                            "layer start -> kernel before attention KV Cast/Slice",
+                        )
+                        set_stage(
+                            "movable_attention_kv_q", block.iloc[0]["start"], block["end"].max(),
+                            "Cast + Slice + KvRmsNormRopeCache -> before Indexer ScatterNdUpdate",
+                        )
+                        set_stage(
+                            "required_indexer_cache_qw", kv_stream.iloc[scatter_pos]["start"],
+                            pre["end"].max(),
+                            "Indexer ScatterNdUpdate -> last compute kernel before LightningIndexer",
+                        )
+            elif prep_location == "after_indexer":
+                # This is the rope_single endpoint in the audited native patch.
+                # A different/fused endpoint must be adapted explicitly, not
+                # silently treated as Indexer output preparation.
+                rope_positions = [
+                    i for i in range(kv_pos + 1, len(kv_stream))
+                    if "interleaverope" in kv_stream.iloc[i]["name"].lower()
+                ]
+                if len(rope_positions) == 1:
+                    block = kv_stream.iloc[movable_pos:rope_positions[0] + 1]
+                    has_q_matmul = block["stage"].isin(["Matmul", "QuantMatmul"]).any()
+                    # start and (start + duration) have distinct floating-point
+                    # rounding after the Decimal-origin subtraction.
+                    if block.iloc[0]["start"] >= indexer_end - 1e-6 and has_q_matmul:
+                        movable_kernel_ids.update(block.index)
+                        set_stage(
+                            "movable_attention_kv_q", block.iloc[0]["start"], block["end"].max(),
+                            "after LI: Cast + Slice + KvRmsNormRopeCache -> attention Q InterleaveRope",
+                        )
+
+    if prep_location == "after_indexer":
+        # Native non-CP, non-quantized indexer cache path supported by the patch.
+        # Multiple pre-LI scatter candidates are ambiguous; leave unresolved.
+        scatters = pre.index[
+            pre["name"].str.contains("scatterndupdate", case=False, na=False)
+        ].tolist()
+        if len(scatters) == 1 and scatters[0] > 0:
+            pos = scatters[0]
+            set_stage("required_qkv_indexer_k", layer_start, pre.iloc[:pos]["end"].max(),
+                      "layer start -> before Indexer ScatterNdUpdate (attention KV/Q deferred)")
+            set_stage("required_indexer_cache_qw", pre.iloc[pos]["start"], pre.iloc[pos:]["end"].max(),
+                      "Indexer ScatterNdUpdate -> last compute kernel before LightningIndexer")
 
     set_stage("lightning_indexer", indexer_start, indexer_end, indexer["name"])
 
-    # Stream can switch between Indexer and SFA (observed at Layer29), so
-    # post-Indexer anchors must be searched across this layer's streams.
+    # Search all streams: stream changes occur in the real baseline. Exclude
+    # deferred KV/Q kernels by their row identities, not a broad time mask.
     between = ld[
         (ld["start"] >= indexer_end) & (ld["start"] < sfa_start)
+        & ~ld.index.isin(movable_kernel_ids)
+        & ~ld["stage"].isin([
+            "CommunicationRuntime", "AllReduce", "AllGather", "ReduceScatter", "AllToAll",
+        ])
     ].sort_values("start").reset_index(drop=True)
     transpose_positions = between.index[
         between["name"].str.contains("transpose", case=False, na=False)
         & ~between["name"].str.contains("batch_matmul_transpose", case=False, na=False)
     ].tolist()
+    post_prep_resolved = (
+        prep_location == "before_indexer"
+        or (prep_location == "after_indexer" and "movable_attention_kv_q" in found)
+    )
     if transpose_positions:
         transpose_pos = transpose_positions[-1]
         transpose = between.iloc[transpose_pos]
-        if transpose_pos > 0:
-            set_stage(
-                "indexer_output_preparation", between.iloc[0]["start"],
-                between.iloc[transpose_pos - 1]["end"],
-                "kernels after LightningIndexer and before Q Transpose",
+        if transpose_pos > 0 and post_prep_resolved:
+            remap = between.iloc[:transpose_pos]
+            # One CSV row can describe only one contiguous module span. If
+            # remaining work straddles the delayed block, do not bridge across
+            # it and double-count that block as remapping.
+            movable = found.get("movable_attention_kv_q")
+            straddles = (
+                prep_location == "after_indexer" and movable is not None
+                and remap.iloc[0]["start"] < movable[0]
+                and remap.iloc[-1]["start"] > movable[1]
             )
+            if not straddles:
+                set_stage(
+                    "indexer_output_preparation", remap.iloc[0]["start"], remap["end"].max(),
+                    "post-LI kernels before Q Transpose, excluding identified attention KV/Q",
+                )
+            else:
+                post_prep_resolved = False
         set_stage("sfa_q_transpose", transpose["start"], transpose["end"], transpose["name"])
+    else:
+        post_prep_resolved = False
 
     set_stage("sparse_flash_attention", sfa_start, sfa_end, sfa["name"])
 
@@ -1300,19 +1510,31 @@ def original_order_for_layer(layer):
         "estimated_layer_end" if bool(layer["layer_end_estimated"]) else "measured",
     )
 
+    stages = list(ORIGINAL_ORDER_STAGES)
+    if prep_location == "after_indexer":
+        movable_stage = stages.pop(1)
+        stages.insert(3, movable_stage)  # after LightningIndexer
     result = []
-    for order, (stage_id, label, category) in enumerate(ORIGINAL_ORDER_STAGES, start=1):
+    for order, (stage_id, label, category) in enumerate(stages, start=1):
         observed = found.get(stage_id)
         absent_status = (
             "not_present" if stage_id in {
                 "indexer_output_preparation", "o_input_quant", "output_communication"
             } else "anchor_not_identified"
         )
+        if stage_id == "indexer_output_preparation" and not post_prep_resolved:
+            absent_status = "anchor_not_identified"
+        if stage_id == "movable_attention_kv_q" and prep_location == "after_indexer":
+            category = "已后移至 Indexer 后"
         first, last, evidence, status = observed if observed else (np.nan, np.nan, "", absent_status)
         result.append({
             "step_id": int(layer["step_id"]),
             "model_layer": int(layer["model_layer"]),
             "stage_order": order,
+            "attention_prepare_location": prep_location,
+            "execution_layout": {
+                "before_indexer": "original", "after_indexer": "attention_deferred"
+            }.get(prep_location, "unresolved") if "movable_attention_kv_q" in found else "unresolved",
             "stage_id": stage_id,
             "stage_name": label,
             "category": category,
@@ -1327,6 +1549,16 @@ def original_order_for_layer(layer):
             "boundary_evidence": evidence,
             "boundary_delta_to_next_us": np.nan,
         })
+    # Sort measured rows by actual timestamps. Missing optional rows are placed
+    # immediately before the next observed stage in the expected layout.
+    for i, row in enumerate(result):
+        row["_sort_start"] = next(
+            (r["trace_start_us"] for r in result[i:] if np.isfinite(r["trace_start_us"])), np.inf
+        )
+    result.sort(key=lambda row: (row["_sort_start"], row["stage_order"]))
+    for order, row in enumerate(result, start=1):
+        row["stage_order"] = order
+        del row["_sort_start"]
     present = [i for i, row in enumerate(result) if np.isfinite(row["trace_start_us"])]
     for current, following in zip(present, present[1:]):
         result[current]["boundary_delta_to_next_us"] = (
@@ -1341,14 +1573,53 @@ decode_original_order_timeline = pd.DataFrame(
     for record in original_order_for_layer(layer)
 )
 
+# Enrich the coarse, additive layer partition with an independently identified
+# KV/Q module span. These diagnostic spans MUST NOT be added to that partition.
+PREPARATION_METRICS = [
+    "attention_prepare_wall_us", "post_indexer_attention_prepare_wall_us",
+]
+ALL_TIMING_METRICS += PREPARATION_METRICS
+if not decode_original_order_timeline.empty:
+    prep = decode_original_order_timeline[
+        decode_original_order_timeline["stage_id"] == "movable_attention_kv_q"
+    ][["step_id", "model_layer", "execution_layout", "attention_prepare_location",
+       "status", "span_us"]].rename(columns={
+           "status": "attention_prepare_status", "span_us": "attention_prepare_wall_us",
+       })
+    prep["post_indexer_attention_prepare_wall_us"] = np.where(
+        prep["attention_prepare_location"] == "after_indexer", prep["attention_prepare_wall_us"],
+        np.where(prep["attention_prepare_location"] == "before_indexer", 0.0, np.nan),
+    )
+    stable_layer_timing = stable_layer_timing.merge(prep, on=["step_id", "model_layer"], how="left")
+    decode_layer_timing_detail = decode_layer_timing_detail.merge(
+        prep, on=["step_id", "model_layer"], how="left",
+    )
+    unresolved = int((prep["attention_prepare_status"] != "measured").sum())
+    if unresolved:
+        print(f"[WARN] {unresolved} 个稳定 decode 层的 attention KV/Q 完整边界未识别；不猜测耗时。")
+    if args.expect_attention_prep != "auto":
+        expected = args.expect_attention_prep + "_indexer"
+        mismatch = int((prep["attention_prepare_location"] != expected).sum())
+        if mismatch:
+            print(f"[WARN] attention KV/Q 预期位置 {expected}：{mismatch}/{len(prep)} 层不符或未识别。")
+
 
 # ============================================================
 # 10. Seven user-facing CSVs; optional debug detail
 # ============================================================
 
+if not decode_original_order_timeline.empty:
+    decode_original_order_timeline = decode_original_order_timeline.merge(
+        step_summary[["step_id", "regime_id", "input_capacity", "shape_signature"]],
+        on="step_id", how="left", validate="many_to_one")
+
+pair_complete = step_summary.step_id.isin(complete_step_ids) & step_summary.prev_step_id.isin(complete_step_ids)
+step_summary.loc[~pair_complete,"profiler_tpot_from_prev_us"] = np.nan
+
 forward_classification = step_summary[
     [
-        "step_id", "step_kind", "moe58_wall_us", "next_step_interval_us",
+        "step_id", "raw_step_id", "regime_id", "input_capacity", "shape_signature", "shape_phase",
+        "step_kind", "profiler_tpot_from_prev_us", "moe58_wall_us", "next_step_interval_us",
         "moe58_kernel_count", "kernel_structure_ok", "wall_plateau_inlier",
         "decode_plateau_start", "wall_ratio_to_decode_tail", "layer60_end_source",
     ]
@@ -1366,22 +1637,33 @@ if not stable_layer_timing.empty:
     aggregation = {
         "samples": ("step_id", "count"),
         "estimated_layer_end_samples": ("layer_end_estimated", "sum"),
+        "attention_prepare_identified_samples": ("attention_prepare_wall_us", "count"),
+        "attention_prepare_after_indexer_samples": (
+            "attention_prepare_location", lambda x: (x == "after_indexer").sum()
+        ),
     }
     for metric in ALL_TIMING_METRICS:
         aggregation[f"{metric}_mean"] = (metric, "mean")
         aggregation[f"{metric}_median"] = (metric, "median")
         aggregation[f"{metric}_p99"] = (metric, percentile_99)
     decode_per_layer = stable_layer_timing.groupby(
-        "model_layer", as_index=False
+        ["regime_id", "input_capacity", "shape_signature", "model_layer"], as_index=False
     ).agg(**aggregation)
 
     per_step_rows = []
     for step_id, group in stable_layer_timing.groupby("step_id"):
         record = {
             "step_id": int(step_id),
+            "regime_id": int(group.iloc[0]["regime_id"]),
+            "input_capacity": int(group.iloc[0]["input_capacity"]),
+            "shape_signature": group.iloc[0]["shape_signature"],
             "measured_or_estimated_layers": int(group["model_layer"].nunique()),
             "estimated_layer_ends": int(group["layer_end_estimated"].sum()),
             "o_projection_identified_layers": int(group["o_projection_wall_us"].notna().sum()),
+            "attention_prepare_identified_layers": int(group["attention_prepare_wall_us"].notna().sum()),
+            "attention_prepare_before_indexer_layers": int((group["attention_prepare_location"] == "before_indexer").sum()),
+            "attention_prepare_after_indexer_layers": int((group["attention_prepare_location"] == "after_indexer").sum()),
+            "attention_prepare_unknown_position_layers": int((group["attention_prepare_location"] == "unknown").sum()),
         }
         for metric in ALL_TIMING_METRICS:
             values = group[metric]
@@ -1399,31 +1681,42 @@ if not stable_layer_timing.empty:
     if decode_per_step["layer_sum_minus_moe58_wall_us"].abs().max() > 1e-6:
         raise RuntimeError("58层分段之和与 step wall time 不一致，请检查层边界。")
 
-    stable_step_set = set(complete_step_ids)
-    stable_intervals = step_summary[
-        step_summary["step_id"].isin(stable_step_set)
-        & step_summary["prev_step_id"].isin(stable_step_set)
-    ]["profiler_tpot_from_prev_us"].dropna().astype(float)
-    summary = {
-        "decode_steps_all": int((step_summary["step_kind"] == "decode").sum()),
-        "stable_complete_steps": len(complete_step_ids),
-        "moe_layers_per_step": NUM_MOE_LAYERS,
-        "layer60_end_estimated": True,
-        "moe58_wall_us_mean": float(decode_per_step["moe58_wall_us"].mean()),
-        "layer_wall_us_sum_mean": float(decode_per_step["layer_wall_us_sum"].mean()),
-        "profiler_tpot_us_mean": (
-            float(stable_intervals.mean()) if len(stable_intervals) else np.nan
-        ),
-        "profiler_tpot_us_median": (
-            float(stable_intervals.median()) if len(stable_intervals) else np.nan
-        ),
-    }
-    for metric in ALL_TIMING_METRICS:
-        summary[f"{metric}_mean_per_layer"] = float(stable_layer_timing[metric].mean())
-        summary[f"{metric}_sum_mean_per_step"] = float(
-            decode_per_step[f"{metric}_sum"].mean()
-        )
-    decode_summary = pd.DataFrame([summary])
+    summaries=[]
+    for regime_id,rg in stable_layer_timing.groupby("regime_id",sort=False):
+        group_steps=decode_per_step[decode_per_step.regime_id.eq(regime_id)]
+        stable_step_set = set(rg.step_id.unique())
+        stable_intervals = step_summary[
+            step_summary["step_id"].isin(stable_step_set)
+            & step_summary["prev_step_id"].isin(stable_step_set)
+        ]["profiler_tpot_from_prev_us"].dropna().astype(float)
+        summary = {
+            "decode_steps_all": int(((step_summary["step_kind"] == "decode") & step_summary.regime_id.eq(regime_id)).sum()),
+            "stable_complete_steps": len(stable_step_set),
+            "moe_layers_per_step": NUM_MOE_LAYERS,
+            "layer60_end_estimated": True,
+            "attention_prepare_identified_layer_samples": int(rg["attention_prepare_wall_us"].notna().sum()),
+            "attention_prepare_before_indexer_layer_samples": int((rg["attention_prepare_location"] == "before_indexer").sum()),
+            "attention_prepare_after_indexer_layer_samples": int((rg["attention_prepare_location"] == "after_indexer").sum()),
+            "attention_prepare_unknown_position_layer_samples": int((rg["attention_prepare_location"] == "unknown").sum()),
+            "moe58_wall_us_mean": float(group_steps["moe58_wall_us"].mean()),
+            "layer_wall_us_sum_mean": float(group_steps["layer_wall_us_sum"].mean()),
+            "profiler_tpot_us_mean": (
+                float(stable_intervals.mean()) if len(stable_intervals) else np.nan
+            ),
+            "profiler_tpot_us_median": (
+                float(stable_intervals.median()) if len(stable_intervals) else np.nan
+            ),
+        }
+        for metric in ALL_TIMING_METRICS:
+            summary[f"{metric}_mean_per_layer"] = float(rg[metric].mean())
+            summary[f"{metric}_sum_mean_per_step"] = float(
+                group_steps[f"{metric}_sum"].mean()
+            )
+        summary.update(regime_id=int(regime_id), input_capacity=int(rg.iloc[0].input_capacity),
+                       shape_signature=rg.iloc[0].shape_signature, profiler_tpot_pairs=len(stable_intervals))
+        summaries.append(summary)
+    decode_summary=pd.DataFrame(summaries)
+
 else:
     decode_per_layer = pd.DataFrame()
     decode_per_step = pd.DataFrame()
@@ -1460,12 +1753,15 @@ if complete_step_ids:
     )
     timeline.insert(0, "step_id", target_step)
     timeline.insert(1, "model_layer", TARGET_MODEL_LAYER)
+    timeline["execution_layout"] = target["execution_layout"]
+    for key in ("regime_id", "input_capacity", "shape_signature"):
+        timeline[key] = target[key]
     timeline["relative_start_us"] = timeline["start"] - layer_start
     timeline["relative_end_us"] = timeline["end"] - layer_start
     selected_layer_timeline = timeline[
         [
-            "step_id", "model_layer", "relative_start_us", "relative_end_us",
-            "duration_us", "stream", "region", "stage", "name", "input_shapes",
+            "step_id", "regime_id", "input_capacity", "shape_signature", "model_layer", "relative_start_us", "relative_end_us",
+            "duration_us", "stream", "region", "execution_layout", "stage", "name", "input_shapes",
         ]
     ].sort_values(["relative_start_us", "stream"], na_position="last")
     selected_layer_original_order = decode_original_order_timeline[
@@ -1476,14 +1772,20 @@ if complete_step_ids:
 outputs = []
 
 def write_table(frame, filename, float_format=None):
-    if frame.empty:
-        return
+    if frame.empty and len(frame.columns)==0:
+        schemas={
+            "decode_summary.csv": ["regime_id","input_capacity","shape_signature","stable_complete_steps","profiler_tpot_us_mean","profiler_tpot_pairs"],
+            "decode_per_layer.csv": ["regime_id","input_capacity","model_layer","samples"],
+            "decode_per_step.csv": ["step_id","regime_id","input_capacity","profiler_tpot_from_prev_us"],
+        }
+        frame=pd.DataFrame(columns=schemas.get(filename,["step_id","model_layer"]))
     path = os.path.join(OUTPUT_DIR, filename)
     frame.to_csv(path, index=False, float_format=float_format)
     outputs.append(path)
 
 
 write_table(forward_classification, "forward_classification.csv")
+write_table(shape_diagnostics, "indexer_shape_diagnostics.csv")
 write_table(decode_summary, "decode_summary.csv")
 write_table(decode_per_layer, "decode_per_layer.csv")
 write_table(decode_per_step, "decode_per_step.csv")
@@ -1496,16 +1798,27 @@ if args.debug:
 print("\n================ Decode Summary ================")
 print(f"Decode steps (incl. long tail): {int((step_summary['step_kind'] == 'decode').sum())}")
 print(f"Stable complete steps         : {len(complete_step_ids)}")
-if not decode_summary.empty:
-    row = decode_summary.iloc[0]
+for _,row in decode_summary.iterrows():
+    print(f"\n--- regime {int(row['regime_id'])}: capacity={int(row['input_capacity'])}, shape={row['shape_signature']} ---")
+    print(f"Stable complete steps         : {int(row['stable_complete_steps'])}")
+    print(f"Profiler TPOT pairs           : {int(row['profiler_tpot_pairs'])}")
     print(f"58-MoE wall mean              : {row['moe58_wall_us_mean']/1000:.3f} ms")
     if pd.notna(row["profiler_tpot_us_mean"]):
         print(f"Profiler TPOT mean            : {row['profiler_tpot_us_mean']/1000:.3f} ms")
     for metric in ["layer_wall_us"] + ADDITIVE_METRICS:
         print(f"{metric:30}: {row[f'{metric}_mean_per_layer']:.3f} us")
+    print("sfa_path_wall_us = Indexer end -> SFA end; includes deferred KV/Q if present.")
+    print("Preparation position (layer samples): " + ", ".join(
+        f"{position}={int(row[f'attention_prepare_{position}_layer_samples'])}"
+        for position in ["before_indexer", "after_indexer", "unknown_position"]
+    ))
+    print("Nested diagnostics (do not add to layer wall):")
+    for metric in PREPARATION_METRICS + ["indexer_to_sfa_gap_us", "sfa_kernel_us"]:
+        print(f"  {metric:42}: {row[f'{metric}_mean_per_layer']:.3f} us")
     print("Layer60 full-layer and MoE times include an estimated terminal gap.")
 if not selected_layer_original_order.empty:
     print("\n========= Selected layer: observed order =========")
+    print("Layout:", selected_layer_original_order.iloc[0]["execution_layout"])
     for _, stage_row in selected_layer_original_order.iterrows():
         span = stage_row["span_us"]
         span_text = f"{span:.3f} us" if pd.notna(span) else stage_row["status"]
