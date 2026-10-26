@@ -8,6 +8,7 @@ See 双batch_profiler分析_使用说明.txt for definitions and limitations.
 import argparse
 import csv
 import json
+import hashlib
 import re
 from collections import Counter
 from decimal import Decimal, InvalidOperation
@@ -256,10 +257,20 @@ def decimal_number(value):
 
 
 def shape_list(value):
-    """Parse CANN shapes without evaluating arbitrary strings."""
+    """Parse CANN shapes, including literal quoting left by CSV/Excel exports.
+
+    Preserve empty argument slots; never eval text or extract arbitrary digits.
+    """
+    def unquote(text):
+        text = text.strip()
+        while len(text) >= 2 and text[0] in (chr(34), chr(39)) and text[-1] == text[0]:
+            text = text[1:-1].strip()
+        return text
     result = []
-    for part in str(value).split(";"):
-        part = part.strip().strip("[]()")
+    for part in unquote(str(value)).split(";"):
+        part = unquote(part)
+        if len(part) >= 2 and (part[0], part[-1]) in (("[", "]"), ("(", ")")):
+            part = part[1:-1].strip()
         if re.fullmatch(r"\d+(?:\s*,\s*\d+)*", part):
             result.append(tuple(int(x) for x in part.split(",")))
         else:
@@ -778,6 +789,18 @@ def layer_record(layer, rows, modules):
 def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58,
             min_steps=3, estimate_gap=True, target_layer=3, target_step=-1, debug=False):
     data, manifest = load_kernels(path, device, sep)
+    shape_diagnostics = []
+    for r in data[data.stage == "LightningIndexer"].itertuples():
+        shapes = shape_list(r.input_shapes)
+        q = shapes[0][0] if shapes and shapes[0] else None
+        req = shapes[5][0] if len(shapes) > 5 and shapes[5] else None
+        shape_diagnostics.append(dict(source_row=r.source_row, kernel_id=r.kernel_id,
+                                      input_shapes_repr=repr(r.input_shapes),
+                                      parsed_shapes=json.dumps(shapes), q_tokens=q,
+                                      request_rows=req, parse_ok=q is not None and req is not None))
+    shape_diagnostics = pd.DataFrame(shape_diagnostics, columns=[
+        "source_row", "kernel_id", "input_shapes_repr", "parsed_shapes",
+        "q_tokens", "request_rows", "parse_ok"])
     layers = reconstruct_layers(data)
     if not layers:
         raise ValueError("No LightningIndexer found.")
@@ -862,6 +885,7 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     out=Path(output_dir)
     out.mkdir(parents=True,exist_ok=True)
     tables={
+        "indexer_shape_diagnostics.csv":shape_diagnostics,
         "forward_classification.csv":forward,
         "all_layer_timing.csv":detail,
         "decode_summary.csv":summary_df,
@@ -880,7 +904,9 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     for name,frame in tables.items():
         frame.to_csv(out/name,index=False,float_format="%.6f",encoding="utf-8-sig")
     manifest.update(
-        analyzer="dualbatch_v4",layers_detected=len(layers),
+        analyzer="dualbatch_v4.1", script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        indexer_shape_parse_failures=int((~shape_diagnostics.parse_ok).sum()),
+        layers_detected=len(layers),
         forward_groups_detected=len(steps),complete_forwards=int(forward.complete.sum()),
         stable_steps=int(forward.stable_decode.sum()),selected_layer_uid=target,
         full_rank_trace_required_for_tpot=True,
@@ -899,7 +925,10 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     print(f"Cleaned kernels: {len(data)}; layer groups: {len(layers)}")
     print(f"Complete MoE forwards: {int(forward.complete.sum())}; stable decode steps: {int(forward.stable_decode.sum())}")
     if not len(stable_steps):
-        print("[WARN] No stable complete forward: exported fragment timings; no fabricated TPOT/layer numbering.")
+        print("[WARN] No stable complete decode: selected timings are observational, not a stable sample.")
+        print("Complete forward phases:", forward.loc[forward.complete, "phase"].value_counts().to_dict())
+    if not shape_diagnostics.parse_ok.all():
+        print("[WARN] Indexer shape parsing failed; inspect indexer_shape_diagnostics.csv.")
     print(f"Selected layer_uid={target}, origin={selected_kernels.relative_origin.iloc[0]}")
     for r in selected_modules.itertuples():
         print(f"{r.module_name:36s} span={r.span_us:10.3f} us; kernel_sum={r.kernel_sum_us:10.3f} us [{r.status}]")
