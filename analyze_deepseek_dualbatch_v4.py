@@ -278,6 +278,79 @@ def shape_list(value):
     return result
 
 
+def core_counts(core, block, mix):
+    """Reported launch blocks for AIC/AIV, not simultaneous busy physical cores.
+
+    Primary Block=0 may mean task-time L0 did not collect it. Secondary Mix=0
+    is accepted only with a valid positive primary count. No inference for HCCL.
+    """
+    def count(value):
+        value=decimal_number(value)
+        return int(value) if value is not None and value>=0 and value==value.to_integral_value() else np.nan
+    primary,secondary=count(block),count(mix)
+    kind=str(core).strip().upper()
+    if kind in {"COMMUNICATION","AI_CPU","AICPU","CPU"}:
+        return np.nan,np.nan,"not_applicable"
+    if kind not in {"AI_CORE","AI_VECTOR_CORE","MIX_AIC","MIX_AIV"}:
+        return np.nan,np.nan,"unavailable"
+    if pd.isna(primary) or primary==0:
+        return np.nan,np.nan,"unavailable"
+    if kind=="AI_CORE":
+        return primary,0,"reported"
+    if kind=="AI_VECTOR_CORE":
+        return 0,primary,"reported"
+    status="partial" if pd.isna(secondary) else "reported"
+    return (primary,secondary,status) if kind=="MIX_AIC" else (secondary,primary,status)
+
+
+def core_profile(rows):
+    """Per-kernel launch configurations. Counts of calls are never core sums."""
+    counted=rows[rows.core_count_status.isin(["reported","partial","unavailable"])]
+    known=counted[counted.core_count_status=="reported"]
+    pairs=Counter((int(r.cube_cores),int(r.vector_cores)) for r in known.itertuples())
+    configs=[dict(cube=c,vector=v,calls=n) for (c,v),n in sorted(pairs.items())]
+    return dict(core_launch_profiles=json.dumps(configs),
+                core_counted_calls=len(known),core_unknown_calls=len(counted)-len(known),
+                core_not_applicable_calls=len(rows)-len(counted),
+                cube_cores_per_kernel_min=counted.cube_cores.min(),
+                cube_cores_per_kernel_max=counted.cube_cores.max(),
+                vector_cores_per_kernel_min=counted.vector_cores.min(),
+                vector_cores_per_kernel_max=counted.vector_cores.max())
+
+
+def core_profile_text(profile):
+    configs=json.loads(profile["core_launch_profiles"])
+    text="; ".join(f"{p['cube']}/{p['vector']} ({p['calls']} calls)" for p in configs[:8]) or "N/A"
+    if len(configs)>8:
+        text+=f"; +{len(configs)-8} configurations (see CSV)"
+    return ("Cube/Vector="+text+
+            f"; unknown={profile['core_unknown_calls']}; non-core={profile['core_not_applicable_calls']}")
+
+
+def summarize_core_usage(kernels, first_moe, moe_count):
+    stable=kernels[kernels.stable_decode & kernels.model_layer.ge(first_moe) &
+                   kernels.model_layer.lt(first_moe+moe_count)]
+    keys=["regime_id","layout","batch_capacity","split_capacity","module"]
+    modules=[]
+    for values,group in stable.groupby(keys,dropna=False,sort=False):
+        record=dict(zip(keys,values))
+        record.update(module_name=LABELS.get(record["module"],record["module"]),
+                      calls=len(group),steps=group.step_id.nunique(),layers=group.layer_uid.nunique(),
+                      **core_profile(group))
+        modules.append(record)
+    columns=keys+["module_name","calls","steps","layers"]+list(core_profile(kernels.iloc[:0]))
+    module_summary=pd.DataFrame(modules,columns=columns)
+    op_keys=keys+["name","core","block_num_raw","mix_block_num_raw",
+                 "cube_cores","vector_cores","core_count_status"]
+    if stable.empty:
+        ops=pd.DataFrame(columns=op_keys+["calls","steps","layers"])
+    else:
+        ops=stable.groupby(op_keys,dropna=False,sort=False).agg(
+            calls=("kernel_id","size"),steps=("step_id","nunique"),layers=("layer_uid","nunique")
+        ).reset_index()
+    return module_summary,ops
+
+
 def load_kernels(path, device=None, separator="auto"):
     with Path(path).open(encoding="utf-8-sig", newline="") as handle:
         sample = handle.read(16384)
@@ -293,7 +366,7 @@ def load_kernels(path, device=None, separator="auto"):
     if headerless:
         required = {0: "Device_id", 1: "Model ID", 2: "Task ID", 3: "Stream ID",
                     4: "Name", 5: "Type", 6: "OP State", 7: "Accelerator Core",
-                    8: "Start Time(us)", 9: "Duration(us)", 14: "Input Shapes", 17: "Output Shapes"}
+                    8: "Start Time(us)", 9: "Duration(us)", 11: "Block Num", 12: "Mix Block Num", 14: "Input Shapes", 17: "Output Shapes"}
         df.columns = [required.get(i, f"extra_{i}") for i in range(len(df.columns))]
     def column(*choices):
         for choice in choices:
@@ -307,6 +380,8 @@ def load_kernels(path, device=None, separator="auto"):
         "task_id": column("Task ID"), "stream": column("Stream ID"),
         "name": column("Name", "Kernel Name", "Op Name"), "op_type": column("Type"),
         "op_state": column("OP State"), "core": column("Accelerator Core"),
+        "block_num_raw": column("Block Num", "Block Dim"),
+        "mix_block_num_raw": column("Mix Block Num", "Mix Block Dim"),
         "input_shapes": column("Input Shapes"), "output_shapes": column("Output Shapes"),
     }
     for field, term in (("start_raw", "start"), ("duration_raw", "duration")):
@@ -316,6 +391,8 @@ def load_kernels(path, device=None, separator="auto"):
             raise ValueError(f"Missing required column: {field}; columns={df.columns.tolist()}")
     data = pd.DataFrame({k: df[v] if v else "" for k, v in mapping.items()})
     data["source_row"] = np.arange(len(data)) + (1 if headerless else 2)
+    counts=[core_counts(c,b,m) for c,b,m in zip(data.core,data.block_num_raw,data.mix_block_num_raw)]
+    data[["cube_cores","vector_cores","core_count_status"]]=pd.DataFrame(counts,index=data.index,columns=["cube_cores","vector_cores","core_count_status"])
     if device is not None:
         data = data[data.device == str(device)].copy()
     if data.device.nunique() > 1:
@@ -711,6 +788,10 @@ def assign_modules(data, layer):
     rows["model_layer"]=layer["model_layer"]
     rows["layout"]=layer["layout"]
     rows["stable_decode"]=layer["stable_decode"]
+    rows["regime_id"]=layer.get("regime_id")
+    q=layer["q_tokens"]
+    rows["batch_capacity"]=sum(q) if q and all(x is not None for x in q) else np.nan
+    rows["split_capacity"]=str(tuple(q))
     rows["relative_start_us"]=rows.start-layer["visible_start"]
     rows["relative_end_us"]=rows.end-layer["visible_start"]
     rows["relative_origin"]="layer_start" if layer["start"] is not None else "fragment_start"
@@ -732,6 +813,7 @@ def module_timings(rows, layer):
                            stable_decode=layer["stable_decode"],regime_id=layer.get("regime_id"),
                            layer_start_missing=layer["start"] is None,
                            layer_end_estimated=layer["end_estimated"],
+                           **core_profile(group),
                            module=module,module_name=LABELS.get(module,module),
                            start_us=start,end_us=end,span_us=end-start,
                            kernel_sum_us=float(group.duration_us.sum()),kernel_union_us=coverage,
@@ -835,7 +917,7 @@ def layer_record(layer, rows, modules):
     return record
 
 
-def format_decode_summary(forward, summary_df, moe_count):
+def format_decode_summary(forward, summary_df, moe_count, core_summary=None):
     """Console/file summary, keeping different graph capacities separate."""
     candidates = forward.complete & forward.phase.isin(["decode_candidate", "decode_dual_schedule"])
     lines = ["", "================ Decode Summary ================",
@@ -877,6 +959,11 @@ def format_decode_summary(forward, summary_df, moe_count):
             span = r.get(key+"_span_us_mean", np.nan)
             if pd.notna(span):
                 lines.append(f"  {label}: {value(span)} / {value(r[key+'_kernel_sum_us_mean'])}")
+        if core_summary is not None and not core_summary.empty:
+            lines.append("Core launch profiles by module (Cube/Vector per kernel; calls are occurrences):")
+            for profile in core_summary[core_summary.regime_id.eq(r['regime_id'])].to_dict("records"):
+                lines.append(f"  {profile['module_name']}: {core_profile_text(profile)}")
+            lines.append("Core counts are launch sizes, NOT module sums or simultaneous occupancy; N/A is not zero.")
         if r['estimated_layer_ends']:
             lines.append(f"Layer {r['last_moe_layer']} full-layer and MoE times include an estimated terminal gap "
                          f"({r['estimated_layer_ends']} layer samples); TPOT uses start timestamps.")
@@ -987,7 +1074,14 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     selected_modules.insert(0,"stage_order",np.arange(1,len(selected_modules)+1))
     out=Path(output_dir)
     out.mkdir(parents=True,exist_ok=True)
+    core_summary,core_ops=summarize_core_usage(kernel_df,first_moe,moe_count)
+    selected_core=selected_kernels[["source_row","layer_uid","step_id","model_layer","regime_id",
+        "batch_capacity","split_capacity","module","name","core","block_num_raw","mix_block_num_raw",
+        "cube_cores","vector_cores","core_count_status","relative_start_us","duration_us"]]
     tables={
+        "decode_module_core_usage.csv":core_summary,
+        "decode_kernel_core_usage.csv":core_ops,
+        "selected_layer_core_usage.csv":selected_core,
         "indexer_shape_diagnostics.csv":shape_diagnostics,
         "forward_classification.csv":forward,
         "all_layer_timing.csv":detail,
@@ -1007,7 +1101,7 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     for name,frame in tables.items():
         frame.to_csv(out/name,index=False,float_format="%.6f",encoding="utf-8-sig")
     manifest.update(
-        analyzer="dualbatch_v4.3", script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        analyzer="dualbatch_v4.4", script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         indexer_shape_parse_failures=int((~shape_diagnostics.parse_ok).sum()),
         layers_detected=len(layers),
         forward_groups_detected=len(steps),complete_forwards=int(forward.complete.sum()),
@@ -1021,6 +1115,8 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
             "Layer numbers require a complete observed 58-MoE forward; excerpts keep IDs blank.",
             "Layer60 uses observed terminal Add; optional median terminal gap is explicitly estimated.",
             "kernel_sum may exceed wall span under concurrency; interval union avoids double-counting.",
+            "cube_cores/vector_cores denote reported launch blocks, not measured simultaneous occupancy.",
+            "Primary Block Num 0/missing => unavailable; Mix Block Num 0 with positive primary is valid.",
             "span_uncovered_us is uncovered time, not a causal measurement of waiting.",
             "Wall partition attributes each inter-module gap to its preceding segment.",
         ])
@@ -1032,16 +1128,17 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
         print("Complete forward phases:", forward.loc[forward.complete, "phase"].value_counts().to_dict())
     if not shape_diagnostics.parse_ok.all():
         print("[WARN] Indexer shape parsing failed; inspect indexer_shape_diagnostics.csv.")
-    summary_text = format_decode_summary(forward, summary_df, moe_count)
+    summary_text = format_decode_summary(forward, summary_df, moe_count, core_summary)
     print(summary_text)
     (out/"decode_summary.txt").write_text(summary_text+"\n", encoding="utf-8")
     print("\n========= Selected layer: observed order =========")
     print(f"Selected layer_uid={target}, origin={selected_kernels.relative_origin.iloc[0]}")
     for r in selected_modules.itertuples():
         print(f"{r.module_name:36s} span={r.span_us:10.3f} us; kernel_sum={r.kernel_sum_us:10.3f} us [{r.status}]")
+        print("  "+core_profile_text(r._asdict()))
     print(f"Outputs: {out.resolve()}")
     return dict(data=data,layers=layers,steps=forward,detail=detail,modules=module_df,
-                partitions=partition_df,kernels=kernel_df,summary=summary_df)
+                partitions=partition_df,kernels=kernel_df,summary=summary_df,core_summary=core_summary,core_ops=core_ops)
 
 
 def main():
