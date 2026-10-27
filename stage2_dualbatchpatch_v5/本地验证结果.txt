@@ -1,0 +1,19 @@
+V5 最近2K attention KV 实验补丁 — 本地验证结果
+日期：2026-10-27
+环境：Python 3.14.4，PyTorch 2.14.1，CPU
+
+全部根目录 Python 文件语法编译通过；请求验证工具 --help 通过。
+test_ring_kv.py：9 项通过。
+test_runtime_hooks.py：3 项通过（模拟目标 runner/worker 接口）。
+test_v4_regression.py：8 项通过，含 312 组 forward/reference 对照。
+test_install.py：2 项通过，临时目录 dry run/安装/重复安装/恢复及版本拒绝。
+共 22 项测试通过；3 个安装 payload 的 SHA256 与 manifest 一致。
+详细标准输出与错误输出见 本地验证日志.txt。
+
+未完成：目标 16 卡 910C 环境真实 KV spec 合并、CANN 算子、FULL_DECODE_ONLY
+图捕获/回放、长时间请求回收与并发压力测试、实际显存容量及 TPOT 测量。
+本包未自动部署到任何远端服务器，也未上传 GitHub。
+CPU 参考测试通过不等于已经验证目标硬件可以运行。
+
+语义：Indexer's cache/算法保留完整历史；只将 SFA 输入索引映射到最近2K。
+过期索引映射与重复项会改变 attention 结果；不得视作保精度压缩。

@@ -1,0 +1,136 @@
+910C V5 实验补丁：最近 2048 attention KV + 完整 Lightning Indexer
+
+适用环境
+基于本项目已审计的 vLLM/vLLM-Ascend 0.23 910C V4 源码。
+保持原 TP8、DP2、EP16、真实 W8A8 模型权重、enable_mlapo=false。
+需要普通 BF16/FP16 attention/indexer cache、block size 128、61 层常规 V3.2。
+支持 NONE / FULL_DECODE_ONLY。不支持 KV connector、prefix caching、MTP、
+CP、LoRA、共享 attention cache 层、量化 sparse KV/indexer cache、IndexCache。
+W8A8 是模型权重量化；它不等同于上述 sparse KV 量化。
+本包未在目标 16 卡机器实测。CPU 参考测试不验证 CANN、ACL 图或性能。
+
+一、实验语义
+1. 每个请求、每层持久保存最近 2048 个 attention KV；请求间不共享槽位。
+2. Lightning Indexer 的完整历史 cache、原 block table、原 slot mapping、
+   原 seq_lens、原 top-k 计算保留。投影与 MoE 权重不做共享或截断。
+3. 仅在 SFA 输入端映射 Indexer 返回值，不原地修改 Indexer 的 top-k 张量。
+   对 query 位置 q，令 h=q+1，s=max(0,h-2048)，w=min(h,2048)。
+   有效索引 i (0<=i<h) 映射到 j=s+((i-s) mod w)。
+   i 已在最近窗口内时 j=i；过期索引映射到最近窗口中同余的位置。
+   -1、负索引、超出该 query 因果范围的索引均保持无效（-1）。
+   映射碰撞会保留重复项，不做去重或重新 top-k，因此会改变注意力权重。
+4. decode 用 j mod 2048 寻址物理环形缓存；RoPE 仍使用真实原始位置。
+5. prefill/mixed 使用每 worker 跨层复用的临时工作区：已有最近 2K 历史
+   加当前 chunk。先进行因果 SFA，再提交该 chunk 结束时最后 2K 到环形缓存。
+   这样不会提前覆盖前面 query 需要的历史，也不会一次 scatter 重复写同一槽。
+   分块大于 2K 仍支持。临时工作区不是所有层的完整历史 cache。
+6. 改变 attention 后，下游隐藏状态及后续层 Indexer 的输入也会改变。
+   “Indexer 不变”指代码、完整 cache 路径及算法不改，不表示结果等于原模型。
+   这是容量/流程实验，不是保精度的 KV 压缩算法或真实 KV offloading。
+
+二、安装（新目录，完整解压；不能只拖两个旧文件）
+把 910C_最近2K_KV与双Batch_V5_实验补丁.zip 解压到 Docker 的 /workspace。
+进入 /workspace/sfa-ring-910c-v5。安装必需文件是：
+  apply_ring_patch.py
+  package_manifest.json
+  sfa_v1.py
+  sfa_ring_kv.py
+  sfa_ring_spec.py
+安装器会修改 5 个容器内目标文件：attention 中上述3个 Python 文件，
+以及 worker/model_runner_v1.py、worker/worker.py 的运行时 hook。
+
+先停止原服务及所有 worker：
+  cd /workspace/sfa-ring-910c-v5
+  python apply_ring_patch.py
+  python apply_ring_patch.py --apply
+
+默认 dry run，不写文件；必须 --apply 才安装。--root 可明确指定包目录：
+  python apply_ring_patch.py --root /vllm-workspace/vllm-ascend/vllm_ascend
+
+安装器校验随包 SHA256、当前 V4 SFA 和已审计 runner 的 SHA256。
+worker.py 仅追加 hook，通过 AST 确认唯一 determine_available_memory 所在类，
+不替换未知方法体；其返回类型/预算会在服务启动时再次校验。
+若提示 Unsupported model_runner_v1.py checksum，请提供该容器中的真实文件，
+不能跳过校验、也不要直接覆盖为 reference 中的快照。
+原文件备份后缀为 .before_ring_v5；root 下保留 sfa_ring_v5_install.json。
+重复安装相同内容不修改文件。安装后必须重启全部 worker、重新捕获图。
+
+三、启动选择（原 vllm serve 命令保持，添加这些环境变量）
+对照两组时共同设置：
+  export VLLM_ASCEND_SFA_RING_KV=1
+  export VLLM_ASCEND_SFA_DEFER_ATTN_PREP=1
+
+不拆分组：
+  export VLLM_ASCEND_SFA_DUAL_BATCH=0
+
+拆分组：
+  export VLLM_ASCEND_SFA_DUAL_BATCH=1
+
+保持原命令的：
+  --additional-config '{"enable_mlapo":false}'
+  --data-parallel-size 2 --tensor-parallel-size 8 --enable-expert-parallel
+  --no-enable-prefix-caching
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,8,12,16]}'
+
+拆分仍只用于符合 V4 条件的 decode；prefill 不做双 batch 拆分。
+DP 紧凑 metadata + NONE 步仍按 V4 回退完整 batch；环形 KV 仍然生效。
+两个拆分选择都读写相同的最近 2K cache，并执行相同的 SFA 索引映射。
+如果设置 DEFER_ATTN_PREP=0 且 DUAL_BATCH=0，则保留不后移顺序，也支持环形 KV。
+切换开关不能热生效，必须重启服务。图中不读取 CPU 动态值。
+
+四、显存与并发
+调度器的逻辑 paged cache 只计完整 Indexer 存储，逻辑序列长度不截为 2K。
+worker 从原 profiler 给出的 cache 预算中先扣除固定 attention 环形缓存、
+prefill 工作区及 metadata 余量，再把余额用于完整 Indexer cache。
+因此是真正缩小 attention 的物理分配，并不是在完整缓存上截取 view。
+启动日志必须同时出现 SFA_RING_KV_BUDGET 和 SFA_RING_KV_ALLOCATION。
+每层 attention 存储按 (max_num_seqs+1)*2048*(512+64)*2 字节计算，
+额外的一个槽仅供 dummy/padding 读取，避免覆盖真实请求。
+Indexer 仍随逻辑上下文长度和并发增长；MoE、权重和激活占用也仍存在。
+此补丁不能保证任意 batch 都可装入显存，实际容量以启动日志和压力测试为准。
+不要沿用手工固定的旧 num-gpu-blocks-override；若超出预算会明确拒绝。
+
+原 max-num-seqs=16 和 capture_sizes=[4,8,12,16] 不会自动变成 B32/B64。
+若扩大并发，需要同步调整每个 DP rank 的 max-num-seqs、图捕获大小、
+benchmark 并发数；DP2 下客户端并发数不等于每个 rank 的实际 decode batch。
+首次先保留原参数验证，再逐档增加。TPOT 计时应关闭 profiler，另跑采样。
+
+五、目标机器验证（本包尚未执行）
+1. 用不拆分组启动，确认显存预算日志和 FULL decode 图捕获成功。
+2. 先检查边界输入 2047、2048、2049，再跑 16K：
+  python verify_ring_requests.py --batch 8 --input-len 2049 --out no_split_2049.json
+  python verify_ring_requests.py --batch 8 --input-len 16384 --out no_split_16k.json
+3. 停服务，DUAL_BATCH=1 重启，保持其他开关/seed/模型相同：
+  python verify_ring_requests.py --batch 8 --input-len 2049 --out split_2049.json --reference no_split_2049.json
+  python verify_ring_requests.py --batch 8 --input-len 16384 --out split_16k.json --reference no_split_16k.json
+4. 检查 tokens_match、logprob 差值和服务健康。浮点拆分可能产生数值差异，
+   若出现差异不能直接认为正确；请保留完整日志/响应进一步定位。
+5. 再验证图大小 4/8/12/16、非目标大小的收尾、连续多轮请求槽位复用。
+6. profiler 检查 Indexer cache 仍为完整逻辑历史；SFA 使用小缓存。
+   decode 新增 remainder/where 等映射算子，prefill 新增工作区复制和提交。
+   这些成本应保留在整体性能统计中。旧分析器可能把新算子归为未识别。
+
+verify_ring_requests.py 仅验证请求完成/输出对照，不是精确 TPOT 或图回放证明。
+服务出现最早的异常时保留完整日志，不只截取 EngineDeadError/Gloo 退出链路。
+
+六、关闭和回退
+只关闭环形缓存，恢复 V4 的完整 KV 行为：
+  export VLLM_ASCEND_SFA_RING_KV=0
+然后重启所有 worker。拆分和后移两个开关仍按 V4 生效。
+若要回到原始完整 cache、不拆分、不后移，三个开关都设置为0后重启。
+
+恢复安装前源文件（同样先停所有 worker）：
+  python apply_ring_patch.py --restore
+  python apply_ring_patch.py --restore --apply
+恢复时检查安装后文件及备份哈希，拒绝覆盖后续其他修改。
+
+七、本机验证范围
+test_ring_kv.py：真实 PyTorch CPU 执行映射/工作区/环形提交与分页 attention 参考。
+覆盖窗口边界、分块超过 2K、mixed、重排、奇数拆分、padding、无效索引、
+cache复用、metadata地址稳定，以及 Indexer 输入/cache 未被这些 helper 修改。
+test_runtime_hooks.py：CPU 模拟 runner/worker，检查预算、实际分配字节数、
+请求更新/预占/回收、dummy、逻辑块清零、未安装 worker hook 和超预算保护。
+test_v4_regression.py：环形开关关闭，原 V4 312 组 forward 对照与紧凑 DP 回退。
+test_install.py：临时目录安装、dry run、重复安装、恢复、未知 runner 拒绝。
+这些测试不验证目标版本的真实 KV spec merge、CANN kernel、图 replay 或性能。
+调度器未保留 RingIndexerSpec 时会在分配前报错，避免错配内存布局。
