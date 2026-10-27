@@ -20,6 +20,9 @@ Capacity-aware revision: safe Indexer Q/block-table shape parsing, per-contiguou
 capacity regime detection and statistics, no TPOT across regimes or missing steps.
 Capacity means execution rows (possibly graph padding), not live request count.
 Single-token prefill can share decode shapes; shape classification is heuristic.
+Core-count revision: preserve Block Num / Mix Block Num, report per-kernel
+Cube/Vector launch configurations by capacity regime and observed module.
+Launch counts do not measure simultaneous physical-core occupancy.
 
 """
 
@@ -32,6 +35,60 @@ from decimal import Decimal, InvalidOperation
 
 import numpy as np
 import pandas as pd
+
+def core_counts(core, block, mix):
+    """Reported launch blocks for AIC/AIV, not simultaneous busy physical cores.
+
+    Primary Block=0 may mean task-time L0 did not collect it. Secondary Mix=0
+    is accepted only with a valid positive primary count. No inference for HCCL.
+    """
+    def count(value):
+        try:
+            value=Decimal(str(value).strip().strip('"'))
+            if not value.is_finite():
+                return np.nan
+        except (InvalidOperation, ValueError, TypeError):
+            return np.nan
+        return int(value) if value is not None and value>=0 and value==value.to_integral_value() else np.nan
+    primary,secondary=count(block),count(mix)
+    kind=str(core).strip().upper()
+    if kind in {"COMMUNICATION","AI_CPU","AICPU","CPU"}:
+        return np.nan,np.nan,"not_applicable"
+    if kind not in {"AI_CORE","AI_VECTOR_CORE","MIX_AIC","MIX_AIV"}:
+        return np.nan,np.nan,"unavailable"
+    if pd.isna(primary) or primary==0:
+        return np.nan,np.nan,"unavailable"
+    if kind=="AI_CORE":
+        return primary,0,"reported"
+    if kind=="AI_VECTOR_CORE":
+        return 0,primary,"reported"
+    status="partial" if pd.isna(secondary) else "reported"
+    return (primary,secondary,status) if kind=="MIX_AIC" else (secondary,primary,status)
+
+
+def core_profile(rows):
+    """Per-kernel launch configurations. Counts of calls are never core sums."""
+    counted=rows[rows.core_count_status.isin(["reported","partial","unavailable"])]
+    known=counted[counted.core_count_status=="reported"]
+    pairs=Counter((int(r.cube_cores),int(r.vector_cores)) for r in known.itertuples())
+    configs=[dict(cube=c,vector=v,calls=n) for (c,v),n in sorted(pairs.items())]
+    return dict(core_launch_profiles=json.dumps(configs),
+                core_counted_calls=len(known),core_unknown_calls=len(counted)-len(known),
+                core_not_applicable_calls=len(rows)-len(counted),
+                cube_cores_per_kernel_min=counted.cube_cores.min(),
+                cube_cores_per_kernel_max=counted.cube_cores.max(),
+                vector_cores_per_kernel_min=counted.vector_cores.min(),
+                vector_cores_per_kernel_max=counted.vector_cores.max())
+
+
+def core_profile_text(profile):
+    configs=json.loads(profile["core_launch_profiles"])
+    text="; ".join(f"{p['cube']}/{p['vector']} ({p['calls']} calls)" for p in configs[:8]) or "N/A"
+    if len(configs)>8:
+        text+=f"; +{len(configs)-8} configurations (see CSV)"
+    return ("Cube/Vector="+text+
+            f"; unknown={profile['core_unknown_calls']}; non-core={profile['core_not_applicable_calls']}")
+
 
 # ============================================================
 # 0. User config
@@ -154,6 +211,24 @@ if shape_col is not None:
     rename_map[shape_col] = "input_shapes"
 
 data = data.rename(columns=rename_map)
+# Exact matching prevents Block Num accidentally selecting Mix Block Num.
+def exact_column(*choices):
+    normalized={re.sub(r"[\s_]", "", c.lower()) for c in choices}
+    return next((c for c in df.columns if re.sub(r"[\s_]", "", str(c).lower()) in normalized), None)
+
+for target,choices in {
+    "core": ("Accelerator Core",),
+    "block_num_raw": ("Block Num", "Block Dim"),
+    "mix_block_num_raw": ("Mix Block Num", "Mix Block Dim"),
+}.items():
+    source=exact_column(*choices)
+    data[target]=df[source].fillna("") if source is not None else ""
+data["source_row"]=np.arange(len(data))+2
+core_columns=["cube_cores","vector_cores","core_count_status"]
+data[core_columns]=pd.DataFrame(
+    [core_counts(c,b,m) for c,b,m in zip(data.core,data.block_num_raw,data.mix_block_num_raw)],
+    index=data.index,columns=core_columns)
+
 if "input_shapes" not in data.columns:
     data["input_shapes"] = ""
 
@@ -1762,11 +1837,79 @@ if complete_step_ids:
         [
             "step_id", "regime_id", "input_capacity", "shape_signature", "model_layer", "relative_start_us", "relative_end_us",
             "duration_us", "stream", "region", "execution_layout", "stage", "name", "input_shapes",
+            "source_row", "core", "block_num_raw", "mix_block_num_raw",
+            "cube_cores", "vector_cores", "core_count_status",
         ]
     ].sort_values(["relative_start_us", "stream"], na_position="last")
     selected_layer_original_order = decode_original_order_timeline[
         (decode_original_order_timeline["step_id"] == target_step)
         & (decode_original_order_timeline["model_layer"] == TARGET_MODEL_LAYER)
+    ].sort_values("stage_order")
+
+
+def build_core_usage(kernels, layers, order):
+    """Assign each stable-layer kernel once; ambiguous/uncovered modules stay unresolved.
+
+    Module membership uses kernel start in the already measured [start,end)
+    span. This does not measure concurrent occupancy or invent physical IDs.
+    """
+    keys=["regime_id","input_capacity","shape_signature","execution_layout","stage_id","stage_name"]
+    details=[]
+    starts=kernels.start.to_numpy()
+    stage_groups={key:g for key,g in order.groupby(["step_id","model_layer"])} if not order.empty else {}
+    for layer in layers.to_dict("records"):
+        lo,hi=np.searchsorted(starts,[layer["layer_start_us"],layer["layer_end_us"]],side="left")
+        part=kernels.iloc[lo:hi].copy()
+        part["step_id"]=layer["step_id"]
+        part["model_layer"]=layer["model_layer"]
+        for key in keys[:4]:
+            part[key]=layer[key]
+        part["relative_start_us"]=part.start-layer["layer_start_us"]
+        part["relative_end_us"]=part.end-layer["layer_start_us"]
+        part["stage_id"]="unresolved"
+        part["stage_name"]="未确定模块"
+        matches=np.zeros(len(part),dtype=int)
+        stages=stage_groups.get((layer["step_id"],layer["model_layer"]))
+        if stages is not None:
+            for stage in stages.to_dict("records"):
+                first,last=stage["trace_start_us"],stage["trace_end_us"]
+                if not (np.isfinite(first) and np.isfinite(last) and last>first):
+                    continue
+                mask=(part.start>=first) & (part.start<last)
+                matches+=mask.to_numpy(dtype=int)
+                part.loc[mask,"stage_id"]=stage["stage_id"]
+                part.loc[mask,"stage_name"]=stage["stage_name"]
+        part["module_assignment"]=np.where(matches==1,"span_matched",np.where(matches==0,"uncovered","ambiguous"))
+        part.loc[matches!=1,["stage_id","stage_name"]]=["unresolved","未确定模块"]
+        details.append(part)
+    detail_columns=["step_id","model_layer"]+keys+[
+        "source_row","relative_start_us","relative_end_us","duration_us","stream","name","input_shapes",
+        "module_assignment","core","block_num_raw","mix_block_num_raw","cube_cores","vector_cores","core_count_status"]
+    detail=pd.concat(details,ignore_index=True)[detail_columns] if details else pd.DataFrame(columns=detail_columns)
+    profiles=[]
+    for values,group in detail.groupby(keys,dropna=False,sort=False):
+        profiles.append(dict(zip(keys,values)) | dict(calls=len(group),steps=group.step_id.nunique(),
+            layer_samples=len(group[["step_id","model_layer"]].drop_duplicates()),**core_profile(group)))
+    modules=pd.DataFrame(profiles,columns=keys+["calls","steps","layer_samples"]+list(core_profile(detail.iloc[:0])))
+    op_keys=keys+["name","core","block_num_raw","mix_block_num_raw","cube_cores","vector_cores","core_count_status"]
+    ops=detail.groupby(op_keys,dropna=False,sort=False).agg(calls=("source_row","size"),
+        steps=("step_id","nunique")).reset_index() if not detail.empty else pd.DataFrame(columns=op_keys+["calls","steps"])
+    stage_profiles=[]
+    for values,group in detail.groupby(["step_id","model_layer","stage_id"],sort=False):
+        stage_profiles.append(dict(zip(["step_id","model_layer","stage_id"],values)) | core_profile(group))
+    stage_profiles=pd.DataFrame(stage_profiles,columns=["step_id","model_layer","stage_id"]+list(core_profile(detail.iloc[:0])))
+    return detail,modules,ops,stage_profiles
+
+
+core_details,core_modules,core_ops,core_stage_profiles=build_core_usage(data,stable_layer_timing,decode_original_order_timeline)
+selected_core=core_details[
+    core_details.step_id.eq(target_step) & core_details.model_layer.eq(TARGET_MODEL_LAYER)
+].copy() if complete_step_ids else core_details.iloc[:0].copy()
+if not decode_original_order_timeline.empty:
+    decode_original_order_timeline=decode_original_order_timeline.merge(
+        core_stage_profiles,on=["step_id","model_layer","stage_id"],how="left",validate="one_to_one")
+    selected_layer_original_order=decode_original_order_timeline[
+        decode_original_order_timeline.step_id.eq(target_step) & decode_original_order_timeline.model_layer.eq(TARGET_MODEL_LAYER)
     ].sort_values("stage_order")
 
 outputs = []
@@ -1784,6 +1927,9 @@ def write_table(frame, filename, float_format=None):
     outputs.append(path)
 
 
+write_table(core_modules, "decode_module_core_usage.csv")
+write_table(core_ops, "decode_kernel_core_usage.csv")
+write_table(selected_core, "selected_layer_core_usage.csv")
 write_table(forward_classification, "forward_classification.csv")
 write_table(shape_diagnostics, "indexer_shape_diagnostics.csv")
 write_table(decode_summary, "decode_summary.csv")
@@ -1815,6 +1961,10 @@ for _,row in decode_summary.iterrows():
     print("Nested diagnostics (do not add to layer wall):")
     for metric in PREPARATION_METRICS + ["indexer_to_sfa_gap_us", "sfa_kernel_us"]:
         print(f"  {metric:42}: {row[f'{metric}_mean_per_layer']:.3f} us")
+    print("Core launch profiles by module (Cube/Vector per kernel; calls are occurrences):")
+    for profile in core_modules[core_modules.regime_id.eq(row["regime_id"])].to_dict("records"):
+        print(f"  {profile['stage_name']}: {core_profile_text(profile)}")
+    print("Core counts are launch sizes, NOT module sums or simultaneous occupancy; N/A is not zero.")
     print("Layer60 full-layer and MoE times include an estimated terminal gap.")
 if not selected_layer_original_order.empty:
     print("\n========= Selected layer: observed order =========")
@@ -1823,6 +1973,8 @@ if not selected_layer_original_order.empty:
         span = stage_row["span_us"]
         span_text = f"{span:.3f} us" if pd.notna(span) else stage_row["status"]
         print(f"{stage_row['stage_order']:2d}. {stage_row['stage_name']:<43} {span_text}")
+        if pd.notna(stage_row.get("core_launch_profiles")):
+            print("    "+core_profile_text(stage_row))
 print("\nGenerated:")
 for path in outputs:
     print(f"  {path}")
