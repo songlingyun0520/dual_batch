@@ -1,0 +1,40 @@
+V5.1：官方 v0.23.0.post1 runner 版本适配（2026-10-28）
+
+原因
+V5 安装器只接受之前审计的 model_runner_v1.py：
+94d75dbeb5d23ab5b383cdc69114167392b967994bb21342cf748b733ba9a968
+官方 v0.23.0.post1 的 runner SHA256 是：
+60b10f97333df49c4bb2a6b5673d13d2d3b964056564c50681984b16fd84d049
+两者差异是 _dummy_run 中将所有 KV group 的 slot_mapping 置为 -1
+的操作提前到 _build_attention_metadata 之前，防止 dummy 写入真实 KV。
+差异全文：reference/V5_runner_to_post1.patch。
+
+来源核验
+官方源码 tag：v0.23.0.post1，commit：1cdb8c4db6e50f36f1fb3283b3e3dd618f6821e8。
+从 quay.io/ascend/vllm-ascend:v0.23.0.post1-a3 的 ARM64 源码 COPY 层
+提取 runner、worker、sfa_v1、KV spec 四个文件，与官方 tag 逐字节相同。
+镜像 digest、源文件 URL、哈希记录在 source_provenance.json。
+用户提供的完整 -a3-openvllm 标签在公开 Quay 查询中返回 404/空列表。
+因此不能宣称已提取该完整标签的镜像；若它包含额外修改，仍需按实际哈希判断。
+
+修复范围
+1. V5.1 安装器同时接受原审计 runner 和上述官方 post1 runner。
+2. 只给 runner/worker 追加 hook，保留官方 dummy-run 修复，不替换原方法体。
+3. 遇到其他 runner 会打印实际路径、实际 SHA256 和支持的 SHA256，继续拒绝写入。
+4. 新增真实 post1 runner/worker 的安装、重复安装、恢复与拒绝修改版测试。
+5. 对官方 KV spec/registry 类体进行 CPU 测试，验证 merge 保留 RingIndexerSpec、
+   Indexer-only page 预算和父类 manager 查找。平台设备检测由 CPU stub 提供。
+6. 三个运行时文件 sfa_v1.py/sfa_ring_kv.py/sfa_ring_spec.py 与 V5 字节相同。
+   16 卡、最近2K、完整 Indexer 和拆分0/1逻辑未改；仍需目标 NPU 图模式验证。
+
+使用
+下载新的 910C_最近2K_KV与双Batch_V5.1_post1适配补丁.zip，完整解压到新目录。
+进入 sfa-ring-910c-v5.1 后执行：
+  python apply_ring_patch.py
+确认识别到 official post1 对应 runner，停止服务及所有 worker，再执行：
+  python apply_ring_patch.py --apply
+启动命令和3个开关见 安装与运行说明.txt。
+
+前一次显示 no files changed，说明没有安装成功，无须删除容器源码或恢复备份。
+不要用 reference 中的 runner 覆盖容器文件，也不要手工修改允许的哈希。
+若仍拒绝，保留新版输出的实际 SHA256 和路径：这能区分镜像派生修改和路径问题。

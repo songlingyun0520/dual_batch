@@ -1,19 +1,19 @@
-V5 最近2K attention KV 实验补丁 — 本地验证结果
-日期：2026-10-27
-环境：Python 3.14.4，PyTorch 2.14.1，CPU
+V5.1 post1 适配验证 — 2026-10-28
+Python 3.12.14：全部根目录 Python 文件语法编译通过。
+CPU 测试环境：Python 3.14.4，torch 2.14.1。
 
-全部根目录 Python 文件语法编译通过；请求验证工具 --help 通过。
 test_ring_kv.py：9 项通过。
-test_runtime_hooks.py：3 项通过（模拟目标 runner/worker 接口）。
-test_v4_regression.py：8 项通过，含 312 组 forward/reference 对照。
-test_install.py：2 项通过，临时目录 dry run/安装/重复安装/恢复及版本拒绝。
-共 22 项测试通过；3 个安装 payload 的 SHA256 与 manifest 一致。
-详细标准输出与错误输出见 本地验证日志.txt。
+test_runtime_hooks.py：3 项通过（模拟 runner/worker）。
+test_v4_regression.py：8 项通过，包含312组 forward/reference 对照。
+test_install.py：4 项通过，覆盖原版和官方 post1 runner/worker 安装与恢复。
+test_post1_contract.py：2 项通过，执行官方 KV spec/registry 类体，确认 merge、
+Indexer-only page 字节预算与父类 manager 查找。平台探测由 CPU stub 提供。
+合计26项测试全部通过。安装器和请求工具 --help 通过。
+3个运行时 payload 哈希正确，与V5一致。
 
-未完成：目标 16 卡 910C 环境真实 KV spec 合并、CANN 算子、FULL_DECODE_ONLY
-图捕获/回放、长时间请求回收与并发压力测试、实际显存容量及 TPOT 测量。
-本包未自动部署到任何远端服务器，也未上传 GitHub。
-CPU 参考测试通过不等于已经验证目标硬件可以运行。
+来源：官方 post1 标签的4个关键源文件，与官方A3 ARM64镜像COPY层逐字节相同。
+-a3-openvllm 完整标签在公开Quay查询中未找到，无法证明该派生镜像全部内容一致。
+本包不将未知 runner 放行；若目标有额外修改，显示实际哈希并停止安装。
 
-语义：Indexer's cache/算法保留完整历史；只将 SFA 输入索引映射到最近2K。
-过期索引映射与重复项会改变 attention 结果；不得视作保精度压缩。
+未执行目标16卡910C上的服务启动、NPU算子、图捕获/回放和性能测试。
+本次CPU测试不等价于完整vLLM调度器或CANN环境验证。

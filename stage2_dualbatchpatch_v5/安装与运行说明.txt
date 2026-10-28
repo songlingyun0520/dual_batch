@@ -1,7 +1,9 @@
-910C V5 实验补丁：最近 2048 attention KV + 完整 Lightning Indexer
+910C V5.1 实验补丁（post1 安装适配）：最近 2048 attention KV + 完整 Lightning Indexer
 
 适用环境
-基于本项目已审计的 vLLM/vLLM-Ascend 0.23 910C V4 源码。
+基于本项目 910C V4 SFA；接受原审计 runner 和官方 v0.23.0.post1 runner。
+已核对官方 A3 ARM64 镜像源码层；-a3-openvllm 完整标签未能从公开仓库验证。
+具体来源、哈希差异及修复范围见 V5.1_版本适配说明.txt。
 保持原 TP8、DP2、EP16、真实 W8A8 模型权重、enable_mlapo=false。
 需要普通 BF16/FP16 attention/indexer cache、block size 128、61 层常规 V3.2。
 支持 NONE / FULL_DECODE_ONLY。不支持 KV connector、prefix caching、MTP、
@@ -29,8 +31,8 @@ W8A8 是模型权重量化；它不等同于上述 sparse KV 量化。
    这是容量/流程实验，不是保精度的 KV 压缩算法或真实 KV offloading。
 
 二、安装（新目录，完整解压；不能只拖两个旧文件）
-把 910C_最近2K_KV与双Batch_V5_实验补丁.zip 解压到 Docker 的 /workspace。
-进入 /workspace/sfa-ring-910c-v5。安装必需文件是：
+把 910C_最近2K_KV与双Batch_V5.1_post1适配补丁.zip 解压到 Docker 的 /workspace。
+进入 /workspace/sfa-ring-910c-v5.1。安装必需文件是：
   apply_ring_patch.py
   package_manifest.json
   sfa_v1.py
@@ -40,7 +42,7 @@ W8A8 是模型权重量化；它不等同于上述 sparse KV 量化。
 以及 worker/model_runner_v1.py、worker/worker.py 的运行时 hook。
 
 先停止原服务及所有 worker：
-  cd /workspace/sfa-ring-910c-v5
+  cd /workspace/sfa-ring-910c-v5.1
   python apply_ring_patch.py
   python apply_ring_patch.py --apply
 
@@ -50,8 +52,8 @@ W8A8 是模型权重量化；它不等同于上述 sparse KV 量化。
 安装器校验随包 SHA256、当前 V4 SFA 和已审计 runner 的 SHA256。
 worker.py 仅追加 hook，通过 AST 确认唯一 determine_available_memory 所在类，
 不替换未知方法体；其返回类型/预算会在服务启动时再次校验。
-若提示 Unsupported model_runner_v1.py checksum，请提供该容器中的真实文件，
-不能跳过校验、也不要直接覆盖为 reference 中的快照。
+若仍提示 Unsupported model_runner_v1.py checksum，请保留输出中的路径和实际 SHA256，
+该文件与两个已审计版本都不匹配；不能跳过校验或覆盖为 reference 中的快照。
 原文件备份后缀为 .before_ring_v5；root 下保留 sfa_ring_v5_install.json。
 重复安装相同内容不修改文件。安装后必须重启全部 worker、重新捕获图。
 
@@ -132,5 +134,6 @@ test_runtime_hooks.py：CPU 模拟 runner/worker，检查预算、实际分配�
 请求更新/预占/回收、dummy、逻辑块清零、未安装 worker hook 和超预算保护。
 test_v4_regression.py：环形开关关闭，原 V4 312 组 forward 对照与紧凑 DP 回退。
 test_install.py：临时目录安装、dry run、重复安装、恢复、未知 runner 拒绝。
-这些测试不验证目标版本的真实 KV spec merge、CANN kernel、图 replay 或性能。
+test_post1_contract.py：执行官方 KV spec/registry 类体，验证 merge、预算和父类查找。
+这些 CPU 测试不验证完整调度器集成、CANN kernel、图 replay 或性能。
 调度器未保留 RingIndexerSpec 时会在分配前报错，避免错配内存布局。

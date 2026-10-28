@@ -1,0 +1,44 @@
+{
+  "checked_on": "2026-10-28",
+  "requested_image": "quay.io/ascend/vllm-ascend:v0.23.0.post1-a3-openvllm",
+  "requested_tag_registry_result": "manifest HTTP 404; public tag lookup empty; exact image contents not verified",
+  "verified_official_base": "quay.io/ascend/vllm-ascend:v0.23.0.post1-a3",
+  "index_digest": "sha256:90179f96a96a0fb9c1d2fc98201d4c653ad3b9da10d08477826b8f1eddbbd77a",
+  "arm64_manifest_digest": "sha256:ed6cd590261296fc3faf8da2038d0bea9de14a79d90187ba63ad86615686b3ec",
+  "source_copy_layer_digest": "sha256:938f5d6b1e591e218a21d81b01a6571efb6dc018b4c4ef8d01b12b019c48aee7",
+  "ascend_source_commit": "1cdb8c4db6e50f36f1fb3283b3e3dd618f6821e8",
+  "vllm_tag_from_image_history": "v0.23.0",
+  "source_files": [
+    {
+      "file": "vllm_ascend/worker/model_runner_v1.py",
+      "sha256": "60b10f97333df49c4bb2a6b5673d13d2d3b964056564c50681984b16fd84d049",
+      "source_url": "https://github.com/vllm-project/vllm-ascend/blob/1cdb8c4db6e50f36f1fb3283b3e3dd618f6821e8/vllm_ascend/worker/model_runner_v1.py",
+      "matches_a3_arm64_copy_layer": true
+    },
+    {
+      "file": "vllm_ascend/worker/worker.py",
+      "sha256": "c392da56095b255d47fe5ad7ffdfbedd269fe69851690e89a8d2ed44c073f6c3",
+      "source_url": "https://github.com/vllm-project/vllm-ascend/blob/1cdb8c4db6e50f36f1fb3283b3e3dd618f6821e8/vllm_ascend/worker/worker.py",
+      "matches_a3_arm64_copy_layer": true
+    },
+    {
+      "file": "vllm_ascend/core/kv_cache_interface.py",
+      "sha256": "a83a04d288f61e60218242fd31bb0ebdd36e44bdbb83b4649cab0c871cdda26b",
+      "source_url": "https://github.com/vllm-project/vllm-ascend/blob/1cdb8c4db6e50f36f1fb3283b3e3dd618f6821e8/vllm_ascend/core/kv_cache_interface.py",
+      "matches_a3_arm64_copy_layer": true
+    },
+    {
+      "file": "vllm_ascend/attention/sfa_v1.py",
+      "sha256": "9f2a521f6eeca5b54f47de54129c6ce2c4ddf5d450e8ab10f111b86d0ba939d8",
+      "source_url": "https://github.com/vllm-project/vllm-ascend/blob/1cdb8c4db6e50f36f1fb3283b3e3dd618f6821e8/vllm_ascend/attention/sfa_v1.py",
+      "matches_a3_arm64_copy_layer": true
+    }
+  ],
+  "reference_sha256": {
+    "reference/post1/ascend_kv_cache_interface.py": "a83a04d288f61e60218242fd31bb0ebdd36e44bdbb83b4649cab0c871cdda26b",
+    "reference/post1/kv_cache_spec_registry.py": "16b3f6458538910f72cdac48554c20432c7ac0e5122e91c8a6219a1ec25f44fe",
+    "reference/post1/model_runner_v1.py": "60b10f97333df49c4bb2a6b5673d13d2d3b964056564c50681984b16fd84d049",
+    "reference/post1/vllm_kv_cache_interface.py": "8d6be98bbf75b3d55007b64ccf5afef047ca01790a432522f70a196412c103d9",
+    "reference/post1/worker.py": "c392da56095b255d47fe5ad7ffdfbedd269fe69851690e89a8d2ed44c073f6c3"
+  }
+}
