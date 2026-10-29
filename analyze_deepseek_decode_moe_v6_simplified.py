@@ -28,6 +28,8 @@ Recent-2K revision: V5/V5.1 UNSPLIT ring attention cache, full Indexer history.
 Requires ring_profiler_support.py beside this file. Auto-detects mapping,
 handles CSV/TSV and headerless excerpts, separates mapping/history/commit work.
 Full 58-MoE stable-step statistics retain the previous conservative rules.
+V3: scalar ring mapping never overrides mismatched token/request-row shapes.
+No capacity cutoff is required for phase classification.
 
 """
 
@@ -1150,10 +1152,9 @@ for layer in moe_layer_summary.itertuples():
         observed_phase = RING_INDEXER_INFO.get(float(part.iloc[0].start), {}).get('phase')
         if observed_phase == 'prefill_or_mixed':
             phase = 'prefill_or_mixed'
-        elif observed_phase == 'decode' and capacities[0] is not None and requests[0] is not None:
-            # Native decode modulo path is stronger evidence than q==request
-            # rows when DP adds token-only padding. Capacity still != live B.
-            phase = 'decode_candidate'
+        # A local decode-ring mapping path does NOT override shape ambiguity.
+        # Q != request rows may be prefill/mixed or token-only DP padding.
+        # Without query-length/scheduler values, keep it out of pure decode.
     layer_shapes[(layer.step_id,layer.model_layer)] = (capacities, requests, phase)
 shape_diagnostics = pd.DataFrame(shape_diagnostics)
 if not shape_diagnostics.empty:
@@ -1166,6 +1167,8 @@ for idx, row in step_summary.iterrows():
     items=[layer_shapes[(row.step_id, layer)] for layer in range(FIRST_MOE_LAYER,LAST_MOE_LAYER+1)]
     signatures=sorted({tuple(x[0]) for x in items},key=str)
     step_summary.at[idx,"shape_signature"] = str(signatures)
+    if len(signatures)==1 and len(signatures[0])==1 and signatures[0][0] is not None:
+        step_summary.at[idx,"input_capacity"] = signatures[0][0]
     phases={x[2] for x in items}
     if phases == {"decode_candidate"} and len(signatures)==1:
         step_summary.at[idx,"input_capacity"] = signatures[0][0]
@@ -1181,6 +1184,10 @@ for idx, row in step_summary.iterrows():
 
 # A user-specified comparison limit does not redefine the execution phase.
 # DP padding can invoke a decode path at a prefill-sized token capacity.
+ambiguous_steps = int(step_summary.shape_phase.eq('prefill_or_dp_padding').sum())
+if ambiguous_steps:
+    print(f"Phase ambiguity (Q tokens != request rows): {ambiguous_steps} steps; "
+          "excluded from pure decode without a capacity cutoff.")
 step_summary['decode_capacity_excluded'] = False
 if args.max_decode_capacity is not None:
     step_summary['decode_capacity_excluded'] = (
@@ -1204,6 +1211,7 @@ for idx,row in step_summary.iterrows():
     previous=(row.input_capacity,row.raw_step_id)
 step_summary["step_kind"]="other"
 step_summary.loc[step_summary.shape_phase.eq('prefill_or_mixed'),'step_kind']='prefill_or_mixed'
+step_summary.loc[step_summary.shape_phase.eq('prefill_or_dp_padding'),'step_kind']='prefill_or_dp_padding'
 step_summary["decode_detection_method"]="shape_not_decode_candidate"
 step_summary.loc[step_summary.decode_capacity_excluded,'decode_detection_method']='excluded_by_capacity_limit'
 for key in ("kernel_structure_ok","wall_plateau_inlier","decode_plateau_start","decode_after_plateau_start"):

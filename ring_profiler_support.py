@@ -135,6 +135,7 @@ def analyze_layer(rows, layer_start=np.nan, layer_end=np.nan, right_complete=Fal
     found, members = {}, {}
     prep_location = 'unknown'
     phase = 'unknown'
+    mapping_path = 'unidentified'
     capacity = requests = np.nan
     compute, compute_stream_status = layer_compute_rows(ld, li, sf)
     compute_streams = json.dumps([int(x) for x in compute.stream.drop_duplicates()])
@@ -171,9 +172,15 @@ def analyze_layer(rows, layer_start=np.nan, layer_end=np.nan, right_complete=Fal
         if sh and len(sh[0])==3 and sh[0][-1]==2048:
             add('ring_index_remap',block,evidence='top-k matrix: validity mask -> modulo -> SelectV2')
             if block.name.str.contains('RemainderTensorTensor',case=False).any():
+                mapping_path='prefill_staging'
                 phase='prefill_or_mixed'
             elif block.name.str.contains('RemainderTensorScalar',case=False).any():
-                phase='decode'
+                mapping_path='decode_ring'
+                # A scalar modulo identifies the local implementation path,
+                # not one-token-per-request scheduling. Do not override the
+                # Q/request-row mismatch (e.g. 4096 token slots, 15 rows).
+                if np.isfinite(capacity) and np.isfinite(requests) and capacity == requests:
+                    phase='decode'
     # History copy/commit: shape + API names distinguish them from Indexer cache.
     def cache_op(row, token):
         s=shape_list(row.input_shapes)
@@ -203,7 +210,7 @@ def analyze_layer(rows, layer_start=np.nan, layer_end=np.nan, right_complete=Fal
         cache_block('aclnnindexselect', 'ring_history_gather')
         cache_block('aclnninplaceindexcopy', 'ring_kv_commit',False)
         if 'ring_kv_commit' in found or 'ring_history_gather' in found:
-            if phase not in ('decode',):phase='prefill_or_mixed'
+            phase='prefill_or_mixed'
         if len(li):add('lightning_indexer',li)
         if len(sf):add('sparse_flash_attention',sf)
         # A missing Cast is normal when slots already have int64 dtype.
@@ -275,6 +282,7 @@ def analyze_layer(rows, layer_start=np.nan, layer_end=np.nan, right_complete=Fal
         timeline.append(dict(step_id=step_id,model_layer=model_layer,stage_id=sid,stage_name=label,
             category='最近2K KV' if sid.startswith('ring_') else label,status=status,
             phase=phase,input_capacity=capacity,request_rows=requests,
+            mapping_path=mapping_path,
             execution_layout=layout,attention_prepare_location=prep_location,
             compute_stream_status=compute_stream_status,compute_streams=compute_streams,
             module_streams=json.dumps([int(x) for x in part.stream.dropna().drop_duplicates()]),
@@ -291,6 +299,7 @@ def analyze_layer(rows, layer_start=np.nan, layer_end=np.nan, right_complete=Fal
     for a,b in zip(present,present[1:]):a['boundary_delta_to_next_us']=b['trace_start_us']-a['trace_end_us']
     for i,r in enumerate(timeline,1):r['stage_order']=i
     info=dict(phase=phase,input_capacity=capacity,request_rows=requests,
+              mapping_path=mapping_path,
               compute_stream_status=compute_stream_status,compute_streams=compute_streams,
               indexer_start_us=li_start,indexer_end_us=li_end,sfa_start_us=sf_start,sfa_end_us=sf_end,
               attention_prepare_location=prep_location,execution_layout=layout,
@@ -373,10 +382,10 @@ def export_observed(data, output_dir, source, origin):
     summary.to_csv(directory/'ring_observed_module_summary.csv',index=False,encoding='utf-8-sig')
     (directory/'ring_analysis_manifest.json').write_text(json.dumps(dict(
         source=str(Path(source).resolve()),timestamp_origin_us=str(origin),
-        schema='ring2k-unsplit-v2',timing='first kernel start to last kernel end; sums reported separately',
+        schema='ring2k-unsplit-v3',timing='first kernel start to last kernel end; sums reported separately',
         observed_scope='local fragments; no absolute model layer or TPOT; clipped modules excluded from means',
         phases=layers.phase.value_counts().to_dict() if len(layers) else {}),ensure_ascii=False,indent=2))
     print('Ring observed layers:',len(layers),'; phases:',layers.phase.value_counts().to_dict() if len(layers) else {})
-    print('Ring parser v2; compute-stream layouts:',
+    print('Ring parser v3; compute-stream layouts:',
           layers.compute_stream_status.value_counts().to_dict() if len(layers) else {})
     return results
