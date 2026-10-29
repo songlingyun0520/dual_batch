@@ -111,11 +111,15 @@ parser.add_argument("--kv-scheme", choices=["auto", "full", "ring2k"], default="
 parser.add_argument("--analysis-scope", choices=["auto", "full", "excerpt"], default="auto",
                     help="auto falls back to observed ring modules if no complete 58-MoE forward exists")
 parser.add_argument("--device-id", help="Select one device before constructing timelines")
+parser.add_argument("--max-decode-capacity", type=int,
+                    help="Optional analysis limit for stable decode capacity; larger executions remain in classification but not TPOT")
 parser.add_argument(
     "--expect-attention-prep", choices=["auto", "before", "after"], default="auto",
     help="Auto-detect KV/Q preparation position; warn if it differs from this expectation",
 )
 args = parser.parse_args()
+if args.max_decode_capacity is not None and args.max_decode_capacity < 1:
+    parser.error('--max-decode-capacity must be positive')
 CSV_PATH = args.csv
 OUTPUT_DIR = args.output_dir
 
@@ -1175,12 +1179,23 @@ for idx, row in step_summary.iterrows():
     elif "unsupported_indexer_count" in phases:
         step_summary.at[idx,"shape_phase"] = "unsupported_indexer_count"
 
+# A user-specified comparison limit does not redefine the execution phase.
+# DP padding can invoke a decode path at a prefill-sized token capacity.
+step_summary['decode_capacity_excluded'] = False
+if args.max_decode_capacity is not None:
+    step_summary['decode_capacity_excluded'] = (
+        step_summary.shape_phase.eq('decode_candidate')
+        & step_summary.input_capacity.gt(args.max_decode_capacity)
+    )
+    print(f"Stable decode capacity limit: {args.max_decode_capacity}; "
+          f"excluded {int(step_summary.decode_capacity_excluded.sum())} candidate steps (retained in classification)")
+
 # Same capacity reappearing later forms a NEW regime. Missing raw steps break it.
 step_summary["regime_id"] = np.nan
 regime=-1
 previous=None
 for idx,row in step_summary.iterrows():
-    if row.shape_phase != "decode_candidate":
+    if row.shape_phase != "decode_candidate" or row.decode_capacity_excluded:
         previous=None
         continue
     if previous is None or previous[0] != row.input_capacity or previous[1]+1 != row.raw_step_id:
@@ -1190,6 +1205,7 @@ for idx,row in step_summary.iterrows():
 step_summary["step_kind"]="other"
 step_summary.loc[step_summary.shape_phase.eq('prefill_or_mixed'),'step_kind']='prefill_or_mixed'
 step_summary["decode_detection_method"]="shape_not_decode_candidate"
+step_summary.loc[step_summary.decode_capacity_excluded,'decode_detection_method']='excluded_by_capacity_limit'
 for key in ("kernel_structure_ok","wall_plateau_inlier","decode_plateau_start","decode_after_plateau_start"):
     step_summary[key]=False
 for key in ("kernel_count_delta","wall_ratio_to_decode_tail"):
@@ -1768,11 +1784,14 @@ forward_classification = step_summary[
         "step_kind", "profiler_tpot_from_prev_us", "moe58_wall_us", "next_step_interval_us",
         "moe58_kernel_count", "kernel_structure_ok", "wall_plateau_inlier",
         "decode_plateau_start", "wall_ratio_to_decode_tail", "layer60_end_source",
+        "decode_capacity_excluded", "decode_detection_method",
     ]
 ].copy().rename(columns={"next_step_interval_us": "model_step_interval_to_next_us"})
 forward_classification["complete_58_layer_timing"] = (
     forward_classification["step_id"].isin(complete_step_ids)
 )
+forward_classification['reconstructed_58_moe_layers'] = True
+forward_classification['stable_complete_decode_step'] = forward_classification['complete_58_layer_timing']
 
 
 def percentile_99(values):
@@ -1997,7 +2016,7 @@ def write_table(frame, filename, float_format=None):
         }
         frame=pd.DataFrame(columns=schemas.get(filename,["step_id","model_layer"]))
     path = os.path.join(OUTPUT_DIR, filename)
-    frame.to_csv(path, index=False, float_format=float_format)
+    frame.to_csv(path, index=False, float_format=float_format, encoding='utf-8-sig')
     outputs.append(path)
 
 

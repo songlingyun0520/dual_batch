@@ -95,6 +95,33 @@ def ring_signature(rows):
             and names.str.contains('swher|selectv2', regex=True).any())
 
 
+def layer_compute_rows(ld, li, sf):
+    """Follow a one-way compute-stream handoff within this bounded layer.
+
+    LI and SFA anchor the two streams. Accept a handoff only if all compute
+    starts on the old stream precede those on the new stream, with no material
+    execution overlap. Communication runtime tasks never establish a handoff.
+    This infers an observed order, not an event/dependency or graph boundary.
+    """
+    pool = ld[~ld.stage.isin(COMM) & ld.stream.notna()].sort_values('start')
+    stream = li.iloc[0].stream if len(li) else (sf.iloc[0].stream if len(sf) else np.nan)
+    if not np.isfinite(stream):
+        counts = pool.stream.value_counts()
+        if len(counts):
+            stream = counts.index[0]
+    old = pool[pool.stream.eq(stream)]
+    if len(li) == 1 and len(sf) == 1 and np.isfinite(sf.iloc[0].stream):
+        next_stream = sf.iloc[0].stream
+        if next_stream != stream:
+            new = pool[pool.stream.eq(next_stream)]
+            # Tiny profiler timestamp overlap can occur at adjacent kernels.
+            if (len(old) and len(new) and old.start.max() < new.start.min()
+                    and old.end.max() <= new.start.min() + 0.5):
+                return pd.concat([old, new]).sort_values('start'), 'sequential_handoff'
+            return old, 'ambiguous_multistream'
+    return old, 'single_stream'
+
+
 def analyze_layer(rows, layer_start=np.nan, layer_end=np.nan, right_complete=False,
                   step_id=np.nan, model_layer=np.nan, end_estimated=False):
     """Classify a bounded unsplit layer/fragment using shapes and ordered anchors.
@@ -109,11 +136,8 @@ def analyze_layer(rows, layer_start=np.nan, layer_end=np.nan, right_complete=Fal
     prep_location = 'unknown'
     phase = 'unknown'
     capacity = requests = np.nan
-    stream = li.iloc[0].stream if len(li) else (sf.iloc[0].stream if len(sf) else np.nan)
-    if not np.isfinite(stream):
-        counts = ld[~ld.stage.isin(COMM) & ld.stream.notna()].stream.value_counts()
-        if len(counts):stream = counts.index[0]
-    compute = ld[ld.stream.eq(stream) & ~ld.stage.isin(COMM)].sort_values('start')
+    compute, compute_stream_status = layer_compute_rows(ld, li, sf)
+    compute_streams = json.dumps([int(x) for x in compute.stream.drop_duplicates()])
     # Do not manufacture single-batch module boundaries for two LI/SFA calls.
     unsupported = len(li)>1 or len(sf)>1
     if len(li)==1:
@@ -252,6 +276,8 @@ def analyze_layer(rows, layer_start=np.nan, layer_end=np.nan, right_complete=Fal
             category='最近2K KV' if sid.startswith('ring_') else label,status=status,
             phase=phase,input_capacity=capacity,request_rows=requests,
             execution_layout=layout,attention_prepare_location=prep_location,
+            compute_stream_status=compute_stream_status,compute_streams=compute_streams,
+            module_streams=json.dumps([int(x) for x in part.stream.dropna().drop_duplicates()]),
             layer_wall_us=layer_end-layer_start if np.isfinite(layer_start) and right_complete else np.nan,
             layer_end_estimated=end_estimated,relative_origin='layer_start' if np.isfinite(layer_start) else 'fragment_start',
             relative_start_us=a-reference,relative_end_us=b-reference,span_us=span,
@@ -265,6 +291,7 @@ def analyze_layer(rows, layer_start=np.nan, layer_end=np.nan, right_complete=Fal
     for a,b in zip(present,present[1:]):a['boundary_delta_to_next_us']=b['trace_start_us']-a['trace_end_us']
     for i,r in enumerate(timeline,1):r['stage_order']=i
     info=dict(phase=phase,input_capacity=capacity,request_rows=requests,
+              compute_stream_status=compute_stream_status,compute_streams=compute_streams,
               indexer_start_us=li_start,indexer_end_us=li_end,sfa_start_us=sf_start,sfa_end_us=sf_end,
               attention_prepare_location=prep_location,execution_layout=layout,
               ring_mapping_observed='ring_index_remap' in found)
@@ -335,19 +362,21 @@ def export_observed(data, output_dir, source, origin):
         part.loc[part.stage.eq('CommunicationRuntime'),'module']='communication_runtime'
         details.append(part)
     directory=Path(output_dir)
-    layers.to_csv(directory/'ring_observed_layers.csv',index=False)
-    stages.to_csv(directory/'ring_observed_modules.csv',index=False,float_format='%.6f')
+    layers.to_csv(directory/'ring_observed_layers.csv',index=False,encoding='utf-8-sig')
+    stages.to_csv(directory/'ring_observed_modules.csv',index=False,float_format='%.6f',encoding='utf-8-sig')
     detail=pd.concat(details,ignore_index=True) if details else pd.DataFrame()
-    detail.drop(columns=['_start_dec'],errors='ignore').to_csv(directory/'ring_observed_kernels.csv',index=False)
+    detail.drop(columns=['_start_dec'],errors='ignore').to_csv(directory/'ring_observed_kernels.csv',index=False,encoding='utf-8-sig')
     measured=stages[stages.status.eq('measured')]
     summary=measured.groupby(['phase','input_capacity','stage_id','stage_name'],dropna=False,as_index=False).agg(
         samples=('span_us','count'),span_us_mean=('span_us','mean'),span_us_min=('span_us','min'),
         span_us_max=('span_us','max'),kernel_duration_sum_us_mean=('kernel_duration_sum_us','mean'))
-    summary.to_csv(directory/'ring_observed_module_summary.csv',index=False)
+    summary.to_csv(directory/'ring_observed_module_summary.csv',index=False,encoding='utf-8-sig')
     (directory/'ring_analysis_manifest.json').write_text(json.dumps(dict(
         source=str(Path(source).resolve()),timestamp_origin_us=str(origin),
-        schema='ring2k-unsplit-v1',timing='first kernel start to last kernel end; sums reported separately',
+        schema='ring2k-unsplit-v2',timing='first kernel start to last kernel end; sums reported separately',
         observed_scope='local fragments; no absolute model layer or TPOT; clipped modules excluded from means',
         phases=layers.phase.value_counts().to_dict() if len(layers) else {}),ensure_ascii=False,indent=2))
     print('Ring observed layers:',len(layers),'; phases:',layers.phase.value_counts().to_dict() if len(layers) else {})
+    print('Ring parser v2; compute-stream layouts:',
+          layers.compute_stream_status.value_counts().to_dict() if len(layers) else {})
     return results
