@@ -24,6 +24,11 @@ Core-count revision: preserve Block Num / Mix Block Num, report per-kernel
 Cube/Vector launch configurations by capacity regime and observed module.
 Launch counts do not measure simultaneous physical-core occupancy.
 
+Recent-2K revision: V5/V5.1 UNSPLIT ring attention cache, full Indexer history.
+Requires ring_profiler_support.py beside this file. Auto-detects mapping,
+handles CSV/TSV and headerless excerpts, separates mapping/history/commit work.
+Full 58-MoE stable-step statistics retain the previous conservative rules.
+
 """
 
 import argparse
@@ -35,6 +40,7 @@ from decimal import Decimal, InvalidOperation
 
 import numpy as np
 import pandas as pd
+import ring_profiler_support as ring_support
 
 def core_counts(core, block, mix):
     """Reported launch blocks for AIC/AIV, not simultaneous busy physical cores.
@@ -100,6 +106,11 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--csv", default="kernel_details.csv", help="kernel_details.csv path")
 parser.add_argument("--output-dir", default="deepseek_decode_no_mlapo_analysis")
 parser.add_argument("--debug", action="store_true", help="Also write per-step/layer timing detail")
+parser.add_argument("--kv-scheme", choices=["auto", "full", "ring2k"], default="auto",
+                    help="auto detects V5/V5.1 recent-2K mapping; full uses legacy classification")
+parser.add_argument("--analysis-scope", choices=["auto", "full", "excerpt"], default="auto",
+                    help="auto falls back to observed ring modules if no complete 58-MoE forward exists")
+parser.add_argument("--device-id", help="Select one device before constructing timelines")
 parser.add_argument(
     "--expect-attention-prep", choices=["auto", "before", "after"], default="auto",
     help="Auto-detect KV/Q preparation position; warn if it differs from this expectation",
@@ -162,7 +173,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Preserve the original timestamp text even when CSV fields have no embedded
 # quote characters. Parsing a ~1e15-us epoch into float before Decimal would
 # already lose sub-microsecond precision and can invent boundary overlaps.
-df = pd.read_csv(CSV_PATH, dtype=str)
+df = ring_support.read_kernel_table(CSV_PATH, args.device_id)
 device_col = next((c for c in df.columns if str(c).lower() in {"device_id", "device id"}), None)
 if device_col is not None and df[device_col].nunique(dropna=True) > 1:
     raise ValueError("CSV 含多个 Device_id；请先按单个 device/rank 拆分，避免交错层时间线。")
@@ -220,10 +231,13 @@ for target,choices in {
     "core": ("Accelerator Core",),
     "block_num_raw": ("Block Num", "Block Dim"),
     "mix_block_num_raw": ("Mix Block Num", "Mix Block Dim"),
+    "output_shapes": ("Output Shapes",),
+    "model_id": ("Model ID",),
+    "op_state": ("OP State",),
 }.items():
     source=exact_column(*choices)
     data[target]=df[source].fillna("") if source is not None else ""
-data["source_row"]=np.arange(len(data))+2
+data["source_row"]=df['_source_record'].to_numpy()
 core_columns=["cube_cores","vector_cores","core_count_status"]
 data[core_columns]=pd.DataFrame(
     [core_counts(c,b,m) for c,b,m in zip(data.core,data.block_num_raw,data.mix_block_num_raw)],
@@ -255,6 +269,9 @@ def parse_decimal(x):
 data["_start_dec"] = data["start_raw"].map(parse_decimal)
 data["duration_us"] = pd.to_numeric(data["duration_raw"], errors="coerce")
 data = data.dropna(subset=["_start_dec", "duration_us"]).copy()
+data = data[data['_start_dec'].map(lambda v: v.is_finite()) & data.duration_us.ge(0)].copy()
+if data.empty:
+    raise ValueError("没有有效的时间戳/持续时间记录")
 
 # Normalize duration to us.
 duration_name = str(duration_col).lower()
@@ -324,7 +341,7 @@ def classify(name):
         return "DynamicQuant"
     if "quantbatchmatmul" in n or "quantmatmul" in n:
         return "QuantMatmul"
-    if "batch_matmul_transpose" in n or "batchmatmultranspose" in n:
+    if "batch_matmul_transpose" in n or "batchmatmultranspose" in n or "transposebatchmatmul" in n:
         return "BatchMatmulTranspose"
     if "swiglu" in n:
         return "SwiGLU"
@@ -390,6 +407,28 @@ data = (
 )
 
 print(f"\nAfter cleaning: {len(data)} kernel records")
+
+RING_MODE = args.kv_scheme == 'ring2k' or (
+    args.kv_scheme == 'auto' and ring_support.ring_signature(data)
+)
+RING_OBSERVATIONS = []
+RING_INDEXER_INFO = {}
+if RING_MODE or args.analysis_scope == 'excerpt':
+    RING_OBSERVATIONS = ring_support.export_observed(data, OUTPUT_DIR, CSV_PATH, t0_dec)
+    RING_INDEXER_INFO = {info['indexer_start_us']: info for info, _, _, _ in RING_OBSERVATIONS
+                        if np.isfinite(info['indexer_start_us'])}
+    if any(info['phase'] == 'unsupported_split' for info, _, _, _ in RING_OBSERVATIONS):
+        raise ValueError('检测到同层多次 Indexer/SFA；本版本适用于 V5/V5.1 未拆分模式，不能套用到双batch。')
+
+def incomplete_trace(message):
+    if RING_OBSERVATIONS and args.analysis_scope != 'full':
+        print('[INFO] '+message)
+        print('仅输出 ring_observed_* 片段分析；不生成稳定 Decode TPOT 或绝对模型层号。')
+        raise SystemExit(0)
+    raise RuntimeError(message)
+
+if args.analysis_scope == 'excerpt':
+    incomplete_trace('用户选择 excerpt；模块耗时按实际可见边界统计。')
 
 
 # ============================================================
@@ -619,11 +658,11 @@ indexer_rows_all = data[data["stage"] == "LightningIndexer"].sort_values("start"
 norm_rows_all = data[data["stage"] == "AddRmsNorm"].sort_values("start").reset_index()
 
 if len(gating_rows) == 0:
-    raise RuntimeError("没有找到 MoeGatingTopK / Gating。")
+    incomplete_trace("没有找到 MoeGatingTopK / Gating。")
 if len(indexer_rows_all) == 0:
-    raise RuntimeError("没有找到 LightningIndexer；请确认这是关闭 enable_mlapo 的采样。")
+    incomplete_trace("没有找到 LightningIndexer；请确认这是关闭 enable_mlapo 的采样。")
 if len(norm_rows_all) == 0:
-    raise RuntimeError("没有找到 AddRmsNormBias，无法可靠定位 attention 层起点。")
+    incomplete_trace("没有找到 AddRmsNormBias，无法可靠定位 attention 层起点。")
 
 indexer_starts = indexer_rows_all["start"].to_numpy(dtype=float)
 norm_starts = norm_rows_all["start"].to_numpy(dtype=float)
@@ -643,7 +682,7 @@ for i, g in enumerate(gating_starts):
         boundary_indices.append(i)
 
 if not boundary_indices:
-    raise RuntimeError(
+    incomplete_trace(
         "没有识别到 forward step 边界。检查 Indexer 分类及 MIN_INDEXERS_BETWEEN_STEPS。"
     )
 
@@ -661,7 +700,7 @@ for k, start_idx in enumerate(boundary_indices):
         )
 
 if not step_groups:
-    raise RuntimeError("没有找到包含完整 58 个 MoE Gating 的 forward step。")
+    incomplete_trace("没有找到包含完整 58 个 MoE Gating 的 forward step。")
 
 print(f"Detected complete forward steps: {len(step_groups)}")
 
@@ -903,7 +942,7 @@ step_summary = pd.DataFrame(step_records)
 moe_layer_summary = pd.DataFrame(moe_layer_records)
 
 if step_summary.empty or moe_layer_summary.empty:
-    raise RuntimeError("58层 MoE step/layer 重建失败。")
+    incomplete_trace("58层 MoE step/layer 重建失败。")
 
 # Re-number valid steps consecutively.
 valid_raw_ids = step_summary["raw_step_id"].tolist()
@@ -1103,6 +1142,14 @@ for layer in moe_layer_summary.itertuples():
         phase = "prefill_or_dp_padding"
     else:
         phase = "decode_candidate"
+    if RING_MODE and len(part) == 1:
+        observed_phase = RING_INDEXER_INFO.get(float(part.iloc[0].start), {}).get('phase')
+        if observed_phase == 'prefill_or_mixed':
+            phase = 'prefill_or_mixed'
+        elif observed_phase == 'decode' and capacities[0] is not None and requests[0] is not None:
+            # Native decode modulo path is stronger evidence than q==request
+            # rows when DP adds token-only padding. Capacity still != live B.
+            phase = 'decode_candidate'
     layer_shapes[(layer.step_id,layer.model_layer)] = (capacities, requests, phase)
 shape_diagnostics = pd.DataFrame(shape_diagnostics)
 if not shape_diagnostics.empty:
@@ -1119,6 +1166,8 @@ for idx, row in step_summary.iterrows():
     if phases == {"decode_candidate"} and len(signatures)==1:
         step_summary.at[idx,"input_capacity"] = signatures[0][0]
         step_summary.at[idx,"shape_phase"] = "decode_candidate"
+    elif "prefill_or_mixed" in phases:
+        step_summary.at[idx,"shape_phase"] = "prefill_or_mixed"
     elif "prefill_or_dp_padding" in phases:
         step_summary.at[idx,"shape_phase"] = "prefill_or_dp_padding"
     elif phases == {"decode_candidate"}:
@@ -1139,6 +1188,7 @@ for idx,row in step_summary.iterrows():
     step_summary.at[idx,"regime_id"]=regime
     previous=(row.input_capacity,row.raw_step_id)
 step_summary["step_kind"]="other"
+step_summary.loc[step_summary.shape_phase.eq('prefill_or_mixed'),'step_kind']='prefill_or_mixed'
 step_summary["decode_detection_method"]="shape_not_decode_candidate"
 for key in ("kernel_structure_ok","wall_plateau_inlier","decode_plateau_start","decode_after_plateau_start"):
     step_summary[key]=False
@@ -1393,6 +1443,11 @@ def original_order_for_layer(layer):
     sfa_start, sfa_end = float(layer["sfa_start_us"]), float(layer["sfa_end_us"])
     moe_start = float(layer["moe_start_us"])
     ld = data[(data["start"] >= layer_start) & (data["start"] < layer_end)].copy()
+    if RING_MODE:
+        return ring_support.analyze_layer(
+            ld, layer_start, layer_end, True, int(layer['step_id']), int(layer['model_layer']),
+            bool(layer['layer_end_estimated']),
+        )[1]
     found = {}
 
     def set_stage(stage_id, first, last, evidence, status="measured"):
@@ -1678,12 +1733,28 @@ if not decode_original_order_timeline.empty:
         if mismatch:
             print(f"[WARN] attention KV/Q 预期位置 {expected}：{mismatch}/{len(prep)} 层不符或未识别。")
 
+RING_METRICS = ['ring_index_remap_wall_us', 'ring_history_gather_wall_us', 'ring_kv_commit_wall_us']
+if RING_MODE and not decode_original_order_timeline.empty:
+    ring_records = []
+    for (step_id, model_layer), stages in decode_original_order_timeline.groupby(['step_id','model_layer']):
+        record = dict(step_id=step_id, model_layer=model_layer)
+        for sid in ['ring_index_remap','ring_history_gather','ring_kv_commit']:
+            row=stages[stages.stage_id.eq(sid)].iloc[0]
+            record[sid+'_wall_us'] = (float(row.span_us) if row.status=='measured'
+                                      else 0.0 if row.status=='not_present_decode' else np.nan)
+        ring_records.append(record)
+    ring_metrics=pd.DataFrame(ring_records)
+    stable_layer_timing=stable_layer_timing.merge(ring_metrics,on=['step_id','model_layer'],validate='one_to_one')
+    decode_layer_timing_detail=decode_layer_timing_detail.merge(ring_metrics,on=['step_id','model_layer'],how='left')
+    ALL_TIMING_METRICS += RING_METRICS
+
 
 # ============================================================
 # 10. Seven user-facing CSVs; optional debug detail
 # ============================================================
 
 if not decode_original_order_timeline.empty:
+    decode_original_order_timeline = decode_original_order_timeline.drop(columns=['input_capacity'], errors='ignore')
     decode_original_order_timeline = decode_original_order_timeline.merge(
         step_summary[["step_id", "regime_id", "input_capacity", "shape_signature"]],
         on="step_id", how="left", validate="many_to_one")
@@ -1850,8 +1921,8 @@ if complete_step_ids:
 def build_core_usage(kernels, layers, order):
     """Assign each stable-layer kernel once; ambiguous/uncovered modules stay unresolved.
 
-    Module membership uses kernel start in the already measured [start,end)
-    span. This does not measure concurrent occupancy or invent physical IDs.
+    Ring modules use explicit source-record membership; legacy modules use
+    kernel starts in measured spans. This does not measure concurrent occupancy.
     """
     keys=["regime_id","input_capacity","shape_signature","execution_layout","stage_id","stage_name"]
     details=[]
@@ -1875,11 +1946,14 @@ def build_core_usage(kernels, layers, order):
                 first,last=stage["trace_start_us"],stage["trace_end_us"]
                 if not (np.isfinite(first) and np.isfinite(last) and last>first):
                     continue
-                mask=(part.start>=first) & (part.start<last)
+                if RING_MODE:
+                    mask=part.source_row.isin(json.loads(stage.get('source_rows', '[]')))
+                else:
+                    mask=(part.start>=first) & (part.start<last)
                 matches+=mask.to_numpy(dtype=int)
                 part.loc[mask,"stage_id"]=stage["stage_id"]
                 part.loc[mask,"stage_name"]=stage["stage_name"]
-        part["module_assignment"]=np.where(matches==1,"span_matched",np.where(matches==0,"uncovered","ambiguous"))
+        part["module_assignment"]=np.where(matches==1,"source_matched" if RING_MODE else "span_matched",np.where(matches==0,"uncovered","ambiguous"))
         part.loc[matches!=1,["stage_id","stage_name"]]=["unresolved","未确定模块"]
         details.append(part)
     detail_columns=["step_id","model_layer"]+keys+[
@@ -1959,7 +2033,7 @@ for _,row in decode_summary.iterrows():
         for position in ["before_indexer", "after_indexer", "unknown_position"]
     ))
     print("Nested diagnostics (do not add to layer wall):")
-    for metric in PREPARATION_METRICS + ["indexer_to_sfa_gap_us", "sfa_kernel_us"]:
+    for metric in PREPARATION_METRICS + (RING_METRICS if RING_MODE else []) + ["indexer_to_sfa_gap_us", "sfa_kernel_us"]:
         print(f"  {metric:42}: {row[f'{metric}_mean_per_layer']:.3f} us")
     print("Core launch profiles by module (Cube/Vector per kernel; calls are occurrences):")
     for profile in core_modules[core_modules.regime_id.eq(row["regime_id"])].to_dict("records"):
