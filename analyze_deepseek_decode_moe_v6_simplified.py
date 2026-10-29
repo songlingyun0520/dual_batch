@@ -108,6 +108,7 @@ RING_STAGE_DEFINITIONS = [
     ('o_input_quant', 'O 投影输入量化'),
     ('o_matmul', 'O 投影 MatMul'),
     ('output_communication', 'O 后通信'),
+    ('output_copy', 'O 后输出复制'),
     ('moe_tail', 'MoE 与层末尾'),
 ]
 RING_COMM_STAGES = {'CommunicationRuntime','AllReduce','AllGather','ReduceScatter','AllToAll'}
@@ -296,6 +297,23 @@ def ring_analyze_layer(rows, layer_start=np.nan, layer_end=np.nan, right_complet
                 comm=ld[(ld.start>=o.start)&(ld.start<moe_start)&
                         ld.stage.isin(['AllReduce','ReduceScatter','AllGather'])]
                 add('output_communication',comm)
+                # Match activation copies to O's actual output shape, rather
+                # than treating every TensorMove as output work (KV copies
+                # also use TensorMove). Require both communication and the
+                # following MoE norm to bound this path.
+                if len(comm) and np.isfinite(moe_start):
+                    output_shapes=ring_shape_list(o.get('output_shapes', ''))
+                    output_shape=output_shapes[0] if output_shapes else ()
+                    candidates=outputs[outputs.start>=comm.end.max()-1e-6]
+                    copies=candidates[candidates.apply(
+                        lambda r: ('aclnninplacecopy_' in r['name'].lower()
+                            and 'tensormove' in r['name'].lower()
+                            and len(output_shape)==2
+                            and ring_shape_list(r.input_shapes)[0]==output_shape
+                            and ring_shape_list(r.get('output_shapes', ''))[0]==output_shape),
+                        axis=1).astype(bool)]
+                    add('output_copy',copies,
+                        evidence='after O collective, before MoE norm; InplaceCopy TensorMove matches O output shape')
         if np.isfinite(moe_start):
             tail=ld[(ld.start>=moe_start)&~ld.stage.eq('CommunicationRuntime')]
             add('moe_tail',tail,
