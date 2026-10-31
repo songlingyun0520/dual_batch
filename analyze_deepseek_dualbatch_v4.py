@@ -1058,7 +1058,16 @@ def format_decode_summary(forward, summary_df, moe_count, core_summary=None):
         for key, label in LABELS.items():
             span = r.get(key+"_span_us_mean", np.nan)
             if pd.notna(span):
-                lines.append(f"  {label}: {value(span)} / {value(r[key+'_kernel_sum_us_mean'])}")
+                count = r.get(key+"_samples", "unknown")
+                lines.append(f"  {label}: {value(span)} / {value(r[key+'_kernel_sum_us_mean'])} "
+                             f"[samples={count}/{r['layer_samples']}]")
+        lines.append("Module means use observed samples only; missing modules are NOT filled with zero.")
+        ring_a = r.get("ring_index_remap_A_samples", 0)
+        ring_b = r.get("ring_index_remap_B_samples", 0)
+        if r['layout'] == 'dual_deferred' and (ring_a or ring_b):
+            if ring_a != r['layer_samples'] or ring_b != r['layer_samples']:
+                lines.append("[WARN] Incomplete A/B ring mapping coverage; inspect unresolved_kernels.csv "
+                             "and all_module_timing.csv before comparing module means.")
         if core_summary is not None and not core_summary.empty:
             lines.append("Core launch profiles by module (Cube/Vector per kernel; calls are occurrences):")
             for profile in core_summary[core_summary.regime_id.eq(r['regime_id'])].to_dict("records"):
@@ -1112,13 +1121,16 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     per_layer=pd.DataFrame(columns=["regime_id","layout","model_layer","samples"])
     metrics=[c for c in detail.columns if c.endswith("_us") and c not in {"start_us","end_us"}]
     if not stable.empty:
-        aggregation={"samples":("layer_uid","count"),
-                     "estimated_layer_end_samples":("layer_end_estimated","sum")}
-        for metric in metrics:
-            for stat in ("mean","median"):
-                aggregation[metric+"_"+stat]=(metric,stat)
-            aggregation[metric+"_p99"]=(metric,lambda x:x.quantile(.99))
-        per_layer=stable.groupby(["regime_id","layout","model_layer"],as_index=False).agg(**aggregation)
+        grouped = stable.groupby(["regime_id", "layout", "model_layer"])
+        # Build numeric blocks at once. Hundreds of named aggregations trigger
+        # repeated frame.insert in pandas, fragmenting the resulting table.
+        per_layer = pd.concat([
+            grouped.layer_uid.count().rename("samples"),
+            grouped.layer_end_estimated.sum().rename("estimated_layer_end_samples"),
+            grouped[metrics].mean().add_suffix("_mean"),
+            grouped[metrics].median().add_suffix("_median"),
+            grouped[metrics].quantile(.99).add_suffix("_p99"),
+        ], axis=1).reset_index()
     step_rows=[]
     for step in steps:
         if not step["stable_decode"]:
@@ -1156,6 +1168,8 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
                        prepare_unknown_samples=int(sg.prep_location.eq("unknown").sum()))
         for metric in metrics:
             summary[metric+"_mean"]=sg[metric].mean()
+        for name in LABELS:
+            summary[name+"_samples"] = int(sg[name+"_span_us"].notna().sum())
         summaries.append(summary)
     summary_df=pd.DataFrame(summaries) if summaries else pd.DataFrame(columns=[
         "regime_id","layout","stable_steps","moe_layers_wall_us_mean","profiler_tpot_us_mean"])
@@ -1181,6 +1195,12 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     selected_core=selected_kernels[["source_row","layer_uid","step_id","model_layer","regime_id",
         "batch_capacity","split_capacity","module","name","core","block_num_raw","mix_block_num_raw",
         "cube_cores","vector_cores","core_count_status","relative_start_us","duration_us"]]
+    # Export complete affected layers, not arbitrary +/- row windows: the
+    # relevant LI/SFA anchors can be dozens of operators away. Prefer the
+    # stable MoE population used by the report when such samples exist.
+    diagnostic_pool = kernel_df[kernel_df.layer_uid.isin(stable.layer_uid)] if not stable.empty else kernel_df
+    unresolved = diagnostic_pool[diagnostic_pool.module.eq("unresolved")]
+    unresolved_context = kernel_df[kernel_df.layer_uid.isin(unresolved.layer_uid.unique())]
     tables={
         "decode_module_core_usage.csv":core_summary,
         "decode_kernel_core_usage.csv":core_ops,
@@ -1196,6 +1216,8 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
             module_df.stable_decode & module_df.model_layer.ge(first_moe) &
             module_df.model_layer.lt(first_moe+moe_count)],
         "selected_layer_timeline.csv":selected_kernels,
+        "unresolved_kernels.csv":kernel_df[kernel_df.module.eq("unresolved")],
+        "unresolved_layer_context.csv":unresolved_context,
         "selected_layer_original_order.csv":selected_modules,
         "layer_wall_partition.csv":partition_df,
     }
@@ -1204,7 +1226,7 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     for name,frame in tables.items():
         frame.to_csv(out/name,index=False,float_format="%.6f",encoding="utf-8-sig")
     manifest.update(
-        analyzer="dualbatch_v4.5_ring2k", script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        analyzer="dualbatch_v4.6_ring2k_coverage", script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         indexer_shape_parse_failures=int((~shape_diagnostics.parse_ok).sum()),
         layers_detected=len(layers),
         forward_groups_detected=len(steps),complete_forwards=int(forward.complete.sum()),
@@ -1224,6 +1246,7 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
             "cube_cores/vector_cores denote reported launch blocks, not measured simultaneous occupancy.",
             "Primary Block Num 0/missing => unavailable; Mix Block Num 0 with positive primary is valid.",
             "span_uncovered_us is uncovered time, not a causal measurement of waiting.",
+            "Module means exclude missing observations; per-module sample counts expose incomplete coverage.",
             "Wall partition attributes each inter-module gap to its preceding segment.",
         ])
     (out/"analysis_manifest.json").write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding="utf-8")
