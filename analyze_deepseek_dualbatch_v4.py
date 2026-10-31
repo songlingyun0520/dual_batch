@@ -470,6 +470,39 @@ def union_duration(rows, start, end):
     return total
 
 
+def layer_compute_path(rows):
+    """Follow sequential stream changes anchored by attention norm/LI/SFA.
+
+    ACL graph tasks can continue on another stream in the middle of remapping.
+    Only join streams when each appears in a single contiguous run and their
+    observed intervals do not overlap. Background metadata/communication on
+    other streams never establishes a handoff. This is timing/order evidence,
+    not proof of a hardware dependency or graph replay.
+    """
+    li = rows[rows.stage.eq("LightningIndexer")]
+    if li.empty:
+        return rows.iloc[:0], "no_indexer_anchor"
+    primary = str(li.iloc[0].stream)
+    anchors = rows[rows.stage.isin(["LightningIndexer", "SparseFlashAttention"])]
+    streams = set(anchors.stream)
+    norms = rows[(rows.stage == "AddRmsNorm") & (rows.start < li.start.min())]
+    if not norms.empty:
+        streams.add(norms.iloc[-1].stream)
+    pool = rows[rows.stream.isin(streams)
+                & ~rows.stage.isin(COMM | {"CommunicationRuntime"})].sort_values(["start", "source_row"])
+    runs = []
+    for r in pool.itertuples():
+        if not runs or runs[-1][0] != r.stream:
+            runs.append([r.stream, r.start, r.end])
+        else:
+            runs[-1][2] = max(runs[-1][2], r.end)
+    sequential = (len({r[0] for r in runs}) == len(runs)
+                  and all(runs[i][2] <= runs[i+1][1] + EPS for i in range(len(runs)-1)))
+    if sequential:
+        return pool, "single_stream" if len(runs) == 1 else "sequential_stream_handoff"
+    return pool[pool.stream == primary], "ambiguous_multistream"
+
+
 def ring_remap_blocks(rows):
     """Recognize bounded top-k mapping chains, independently before each SFA.
 
@@ -481,15 +514,17 @@ def ring_remap_blocks(rows):
     sf = rows[rows.stage.eq("SparseFlashAttention")]
     if len(li) != len(sf) or len(sf) not in (1, 2):
         return []
+    compute, _ = layer_compute_path(rows)
     lower = float(li.end.max())
     blocks = []
     allowed = ("gescalar", "lttensor", "bitwiseandtensor", "remaindertensor",
                "aclnnsubs_", "aclnnsub_", "aclnnclamp_", "aclnnadd_",
                "inplacefillscalar", "swhere", "selectv2")
     for j, (_, sfa) in enumerate(sf.iterrows()):
-        pool = rows[(rows.stream == sfa.stream) & (rows.start >= lower-EPS)
-                    & (rows.end <= sfa.start+EPS)
-                    & ~rows.stage.isin(COMM | {"CommunicationRuntime"})]
+        if sfa.name not in compute.index:
+            lower = float(sfa.end)
+            continue
+        pool = compute[(compute.start >= lower-EPS) & (compute.end <= sfa.start+EPS)]
         begins = pool[pool.name.str.contains("GeScalar", case=False)]
         ends = pool[pool.name.str.contains("SWhere|SelectV2", case=False, regex=True)]
         if not begins.empty and len(ends) == 1:
@@ -783,8 +818,7 @@ def assign_modules(data, layer):
     li = rows[rows.stage=="LightningIndexer"]
     sfa = rows[rows.stage=="SparseFlashAttention"]
     is_dual = len(li)==2  # descriptive even if the fragment has no complete SFA
-    stream = str(li.iloc[0].stream)
-    compute = rows[(rows.stream == stream) & (rows.stage != "CommunicationRuntime")]
+    compute, compute_path_status = layer_compute_path(rows)
     def assign(ids, module):
         ids = rows.index.intersection(ids)
         ids = ids[rows.loc[ids,"module"] != "communication_runtime"]
@@ -888,6 +922,7 @@ def assign_modules(data, layer):
     rows["batch_capacity"]=sum(q) if q and all(x is not None for x in q) else np.nan
     rows["split_capacity"]=str(tuple(q))
     rows["effective_request_count_status"]="unknown_from_kernel_shapes"
+    rows["compute_path_status"] = compute_path_status
     rows["relative_start_us"]=rows.start-layer["visible_start"]
     rows["relative_end_us"]=rows.end-layer["visible_start"]
     rows["relative_origin"]="layer_start" if layer["start"] is not None else "fragment_start"
@@ -963,6 +998,7 @@ def layer_record(layer, rows, modules):
     record["batch_capacity"] = sum(layer["q_tokens"]) if all(
         x is not None for x in layer["q_tokens"]) else np.nan
     record["effective_request_count_status"] = "unknown_from_kernel_shapes"
+    record["compute_path_status"] = rows.compute_path_status.iloc[0]
     record["layer_wall_us"] = end-start if start is not None and end is not None else np.nan
     record["layer_complete"] = bool(start is not None and end is not None and layer["body_complete"])
     record["layer_end_estimated"] = layer["end_estimated"]
@@ -1226,7 +1262,7 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     for name,frame in tables.items():
         frame.to_csv(out/name,index=False,float_format="%.6f",encoding="utf-8-sig")
     manifest.update(
-        analyzer="dualbatch_v4.6_ring2k_coverage", script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        analyzer="dualbatch_v4.7_ring2k_streams", script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         indexer_shape_parse_failures=int((~shape_diagnostics.parse_ok).sum()),
         layers_detected=len(layers),
         forward_groups_detected=len(steps),complete_forwards=int(forward.complete.sum()),
@@ -1247,6 +1283,7 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
             "Primary Block Num 0/missing => unavailable; Mix Block Num 0 with positive primary is valid.",
             "span_uncovered_us is uncovered time, not a causal measurement of waiting.",
             "Module means exclude missing observations; per-module sample counts expose incomplete coverage.",
+            "Cross-stream module attribution requires a sequential non-overlapping path anchored by norm/LI/SFA.",
             "Wall partition attributes each inter-module gap to its preceding segment.",
         ])
     (out/"analysis_manifest.json").write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding="utf-8")
