@@ -4,6 +4,8 @@ Standalone: Python 3.10+, numpy, pandas. No NPU runtime required.
 Reuses classification and robust plateau algorithm from v6_simplified; layer
 boundaries group Indexers by attention-side norm, never by each Indexer.
 See 双batch_profiler分析_使用说明.txt for definitions and limitations.
+Ring-2K revision: independently attribute A/B top-k remapping and O output
+copies. Shape capacities include padding; effective request counts are unknown.
 """
 import argparse
 import csv
@@ -468,6 +470,55 @@ def union_duration(rows, start, end):
     return total
 
 
+def ring_remap_blocks(rows):
+    """Recognize bounded top-k mapping chains, independently before each SFA.
+
+    Require both API and shape evidence. Do not call unrelated modulo/slot
+    arithmetic a remap, or absorb another stream's communication into it.
+    A scalar modulo indicates the local ring path, not effective batch size.
+    """
+    li = rows[rows.stage.eq("LightningIndexer")]
+    sf = rows[rows.stage.eq("SparseFlashAttention")]
+    if len(li) != len(sf) or len(sf) not in (1, 2):
+        return []
+    lower = float(li.end.max())
+    blocks = []
+    allowed = ("gescalar", "lttensor", "bitwiseandtensor", "remaindertensor",
+               "aclnnsubs_", "aclnnsub_", "aclnnclamp_", "aclnnadd_",
+               "inplacefillscalar", "swhere", "selectv2")
+    for j, (_, sfa) in enumerate(sf.iterrows()):
+        pool = rows[(rows.stream == sfa.stream) & (rows.start >= lower-EPS)
+                    & (rows.end <= sfa.start+EPS)
+                    & ~rows.stage.isin(COMM | {"CommunicationRuntime"})]
+        begins = pool[pool.name.str.contains("GeScalar", case=False)]
+        ends = pool[pool.name.str.contains("SWhere|SelectV2", case=False, regex=True)]
+        if not begins.empty and len(ends) == 1:
+            block = pool[(pool.start >= begins.iloc[0].start)
+                         & (pool.start <= ends.iloc[0].start)]
+            names = block.name.str.lower()
+            first_shapes = shape_list(begins.iloc[0].input_shapes)
+            out_shapes = shape_list(ends.iloc[0].output_shapes)
+            sf_shapes = shape_list(sfa.input_shapes)
+            matrix = first_shapes[0] if first_shapes else ()
+            valid_shape = (len(matrix) == 3 and matrix[1:] == (1, 2048)
+                           and len(sf_shapes) > 3 and sf_shapes[3] == matrix
+                           and out_shapes and out_shapes[0] == matrix)
+            valid_chain = (names.str.contains("greaterequal").any()
+                           and names.str.contains("less").any()
+                           and names.str.contains("logicaland").any()
+                           and names.str.contains("floormod").any()
+                           and names.map(lambda n: any(x in n for x in allowed)).all())
+            if valid_shape and valid_chain:
+                tag = ("A" if j == 0 else "B") if len(sf) == 2 else "single"
+                path = ("prefill_staging" if names.str.contains("remaindertensortensor").any()
+                        else "decode_ring" if names.str.contains("remaindertensorscalar").any()
+                        else "unknown")
+                blocks.append(dict(module=f"ring_index_remap_{tag}", ids=block.index.tolist(),
+                                   path=path, capacity=matrix[0]))
+        lower = float(sfa.end)
+    return blocks
+
+
 def reconstruct_layers(data):
     """A/B Indexers share the same preceding attention norm: one layer."""
     indexers = data[data.stage == "LightningIndexer"]
@@ -526,6 +577,12 @@ def reconstruct_layers(data):
             phase = "prefill_or_dp_padding"
         else:
             phase = "unknown"
+        remaps = ring_remap_blocks(rows)
+        mapping_signature = ";".join(f'{b["module"]}={b["path"]}' for b in remaps) or "not_observed"
+        # Tensor-modulo staging is prefill evidence. Scalar mapping must NEVER
+        # override ambiguous Q/request-row shapes or establish an actual batch.
+        if any(b["path"] == "prefill_staging" for b in remaps):
+            phase = "prefill_or_mixed"
         moe_norm = None
         if len(gates) == 1 and not sfas.empty:
             candidates = rows[(rows.stage == "AddRmsNorm") &
@@ -533,14 +590,28 @@ def reconstruct_layers(data):
             if len(candidates) == 1:
                 moe_norm = float(candidates.iloc[0].start)
         next_start = groups[i+1]["start"] if i+1 < len(groups) else None
+        boundary_source = "next_attention_start" if next_start is not None else "unresolved"
+        # An excerpt can end in the NEXT layer's QKV before its first Indexer.
+        # Its attention norm still provides a measured right boundary; never
+        # charge that partial next layer to the current MoE tail.
+        if next_start is None and len(combine) == 1 and len(gates) == 1:
+            following_norm = rows[(rows.stage == "AddRmsNorm")
+                                  & (rows.start >= float(combine.end.max())-EPS)]
+            if not following_norm.empty:
+                next_start = float(following_norm.iloc[0].start)
+                upper = next_start
+                # Could be the next attention norm OR the final model norm
+                # before LM Head; an excerpt cannot always distinguish them.
+                boundary_source = "following_norm_boundary"
         layers.append(dict(
             layer_uid=i, start=start, visible_start=visible_start, upper=upper,
-            end=next_start, end_source="next_attention_start" if next_start is not None else "unresolved",
+            end=next_start, end_source=boundary_source,
             end_estimated=False, li_ids=group["li_ids"], sfa_ids=sfas.index.tolist(),
             gating_count=len(gates), gating_start=float(gates.iloc[0].start) if len(gates)==1 else None,
             combine_end=float(combine.end.max()) if len(combine)==1 else None,
             moe_start=moe_norm, layout=layout, phase=phase, shape_relation=shape_relation,
             q_tokens=q_tokens, request_rows=request_rows, prep_location=prep_location,
+            mapping_signature=mapping_signature,
             step_id=None, model_layer=None, stable_decode=False,
             body_complete=bool(schedule_ok and len(gates)==1 and len(combine)==1 and moe_norm is not None),
         ))
@@ -611,15 +682,19 @@ def reconstruct_forwards(data, layers, first_moe=3, moe_count=58, estimate_gap=T
             phase = "decode_candidate"
         elif "prefill_or_dp_padding" in phases:
             phase = "prefill_or_dp_padding"
+        elif "prefill_or_mixed" in phases:
+            phase = "prefill_or_mixed"
         else:
             phase = "unknown"
         layouts = {x["layout"] for x in group}
         layout = next(iter(layouts)) if len(layouts)==1 else "mixed_layout"
         counts = rows[rows.stage != "CommunicationRuntime"].stage.value_counts()
         signature = sorted({tuple(x["q_tokens"]) for x in group}, key=str)
+        mapping_signature = str(sorted({x["mapping_signature"] for x in group}))
         step.update(complete=True, phase=phase, layout=layout, moe_start_us=start,
                     moe_end_us=end, moe_wall_us=end-start, kernel_count=int(counts.sum()),
                     shape_signature=str(signature), last_layer_end_estimated=last["end_estimated"],
+                    mapping_signature=mapping_signature,
                     last_layer_end_source=last["end_source"], terminal_gap_us=gap,
                     reason="complete_MoE_structure")
         for name in ("Gating","Dispatch","Expert_GEMM1","Expert_GEMM2","Combine"):
@@ -633,7 +708,8 @@ def classify_stable_steps(steps, layers, min_steps=3):
     runs = []
     for i, step in enumerate(steps):
         eligible = step["complete"] and step["phase"] in {"decode_candidate","decode_dual_schedule"}
-        sig = (step.get("layout"), step.get("shape_signature")) if eligible else None
+        sig = (step.get("layout"), step.get("shape_signature"),
+               step.get("mapping_signature")) if eligible else None
         if eligible:
             if runs and runs[-1]["last"] == i-1 and runs[-1]["sig"] == sig:
                 runs[-1]["indices"].append(i)
@@ -686,11 +762,15 @@ LABELS = {
     "merge_preparation": "合并 A/B 的 q_c 与 KV 投影",
     "attention_kv_q": "完整 batch：attention KV 写入与 Q 准备",
     "sfa_q_layout": "SFA 前 Q 连续化 / 转置",
+    "ring_index_remap_A": "A：Indexer 输出映射到最近 2K KV",
+    "ring_index_remap_B": "B：Indexer 输出映射到最近 2K KV",
+    "ring_index_remap_single": "完整 batch：Indexer 输出映射到最近 2K KV",
     "sfa_A": "SparseFlashAttention A", "sfa_B": "SparseFlashAttention B",
     "sfa_single": "SparseFlashAttention（完整 batch）",
     "merge_sfa_output": "合并 A/B SFA 输出",
     "v_up_projection": "V 上投影", "o_input_quant": "O 投影输入量化",
     "o_matmul": "O 投影 MatMul", "output_communication": "O 后通信",
+    "output_copy": "O 后输出复制",
     "moe": "MoE 与层末尾", "unresolved": "未归属算子",
 }
 
@@ -762,6 +842,8 @@ def assign_modules(data, layer):
     for j,(idx,_) in enumerate(sfa.iterrows()):
         tag=("A" if j==0 else "B") if len(sfa)==2 else "single"
         assign([idx],f"sfa_{tag}")
+    for block in ring_remap_blocks(rows):
+        assign(block["ids"], block["module"])
     if not sfa.empty:
         post = rows[(rows.start>=sfa.end.max()-EPS) &
                     (rows.start<(layer["moe_start"] if layer["moe_start"] is not None else layer["upper"]))]
@@ -778,6 +860,19 @@ def assign_modules(data, layer):
                 assign(quant.index,"o_input_quant")
                 comm=post[(post.start>=o.iloc[0].end-EPS) & post.stage.isin(COMM)]
                 assign(comm.index,"output_communication")
+                # Distinguish O activation copy from cache TensorMove kernels.
+                out_shapes = shape_list(o.iloc[0].output_shapes)
+                if len(comm) and layer["moe_start"] is not None and out_shapes:
+                    target_shape = out_shapes[0]
+                    copies = post[(post.stream == v.iloc[0].stream)
+                                  & (post.start >= comm.end.max()-EPS)]
+                    ids = [r.Index for r in copies.itertuples()
+                           if "aclnninplacecopy_" in r.name.lower()
+                           and "tensormove" in r.name.lower()
+                           and len(target_shape) == 2
+                           and shape_list(r.input_shapes)[:1] == [target_shape]
+                           and shape_list(r.output_shapes)[:1] == [target_shape]]
+                    assign(ids, "output_copy")
     if layer["moe_start"] is not None:
         end=layer["end"] if layer["end"] is not None else layer["upper"]
         assign(rows[(rows.start>=layer["moe_start"]) & (rows.start<end)].index,"moe")
@@ -792,6 +887,7 @@ def assign_modules(data, layer):
     q=layer["q_tokens"]
     rows["batch_capacity"]=sum(q) if q and all(x is not None for x in q) else np.nan
     rows["split_capacity"]=str(tuple(q))
+    rows["effective_request_count_status"]="unknown_from_kernel_shapes"
     rows["relative_start_us"]=rows.start-layer["visible_start"]
     rows["relative_end_us"]=rows.end-layer["visible_start"]
     rows["relative_origin"]="layer_start" if layer["start"] is not None else "fragment_start"
@@ -864,6 +960,9 @@ def layer_record(layer, rows, modules):
     record = {k:v for k,v in layer.items() if k not in {"li_ids","sfa_ids"}}
     record["q_tokens"] = json.dumps(layer["q_tokens"])
     record["request_rows"] = json.dumps(layer["request_rows"])
+    record["batch_capacity"] = sum(layer["q_tokens"]) if all(
+        x is not None for x in layer["q_tokens"]) else np.nan
+    record["effective_request_count_status"] = "unknown_from_kernel_shapes"
     record["layer_wall_us"] = end-start if start is not None and end is not None else np.nan
     record["layer_complete"] = bool(start is not None and end is not None and layer["body_complete"])
     record["layer_end_estimated"] = layer["end_estimated"]
@@ -931,6 +1030,7 @@ def format_decode_summary(forward, summary_df, moe_count, core_summary=None):
         return f"{v / (1000 if unit == 'ms' else 1):.3f} {unit}" if pd.notna(v) else "N/A"
     for r in summary_df.to_dict("records"):
         lines += ["", f"--- regime {int(r['regime_id'])}: {r['layout']}, shape={r['shape_signature']} ---",
+                  f"Mapping path                  : {r.get('mapping_signature', 'not_observed')}",
                   f"Stable complete steps         : {r['stable_steps']}",
                   f"{moe_count}-MoE wall mean              : {value(r['moe_layers_wall_us_mean'], 'ms')}",
                   f"Profiler TPOT mean            : {value(r['profiler_tpot_us_mean'], 'ms')}",
@@ -941,7 +1041,7 @@ def format_decode_summary(forward, summary_df, moe_count, core_summary=None):
         lines += [f"Phase boundary samples: {r['phase_boundary_samples']}/{r['layer_samples']}",
                   "pre_indexer_wall_us = layer start -> Indexer A start + Indexer A end -> Indexer B start (dual).",
                   "lightning_indexer_wall_us = sum of Indexer kernel durations (A+B for dual).",
-                  "sfa_path_wall_us = last Indexer end -> last SFA end; includes deferred KV/Q and merges if present.",
+                  "sfa_path_wall_us = last Indexer end -> last SFA end; includes deferred KV/Q, merges and A/B ring remapping.",
                   "output_path_wall_us = last SFA end -> MoE input norm start.",
                   "Preparation position (layer samples): "
                   f"before_indexer={r['prepare_before_indexer_samples']}, "
@@ -968,6 +1068,7 @@ def format_decode_summary(forward, summary_df, moe_count, core_summary=None):
             lines.append(f"Layer {r['last_moe_layer']} full-layer and MoE times include an estimated terminal gap "
                          f"({r['estimated_layer_ends']} layer samples); TPOT uses start timestamps.")
     lines.append("Units: wall/span/kernel_sum are us; TPOT and whole-forward wall above are ms.")
+    lines.append("Shapes are graph/token capacities including padding, NOT effective request counts; stable capacity does not prove stable effective workload.")
     return "\n".join(lines)
 
 
@@ -1031,15 +1132,17 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
             raise ValueError("MoE layer wall sum does not match forward span.")
         step_rows.append(dict(step_id=step["step_id"],regime_id=step.get("regime_id"),
                               layout=step["layout"],shape_signature=step["shape_signature"],
+                              mapping_signature=step["mapping_signature"],
                               layers=len(group),estimated_layer_ends=int(group.layer_end_estimated.sum()),
                               moe_layers_wall_us=total,profiler_tpot_us=step["profiler_tpot_us"],
                               layer_sum_error_us=error))
-    per_step=pd.DataFrame(step_rows,columns=["step_id","regime_id","layout","shape_signature","layers",
+    per_step=pd.DataFrame(step_rows,columns=["step_id","regime_id","layout","shape_signature","mapping_signature","layers",
                                            "estimated_layer_ends","moe_layers_wall_us","profiler_tpot_us",
                                            "layer_sum_error_us"])
     summaries=[]
     for regime,g in per_step.groupby("regime_id"):
         summary=dict(regime_id=regime,layout=g.layout.iloc[0],shape_signature=g.shape_signature.iloc[0],
+                     mapping_signature=g.mapping_signature.iloc[0],
                      stable_steps=len(g),moe_layers=moe_count,
                      moe_layers_wall_us_mean=g.moe_layers_wall_us.mean(),
                      profiler_tpot_us_mean=g.profiler_tpot_us.mean(),
@@ -1101,7 +1204,7 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     for name,frame in tables.items():
         frame.to_csv(out/name,index=False,float_format="%.6f",encoding="utf-8-sig")
     manifest.update(
-        analyzer="dualbatch_v4.4", script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        analyzer="dualbatch_v4.5_ring2k", script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         indexer_shape_parse_failures=int((~shape_diagnostics.parse_ok).sum()),
         layers_detected=len(layers),
         forward_groups_detected=len(steps),complete_forwards=int(forward.complete.sum()),
@@ -1112,6 +1215,9 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
             "Single Indexer/SFA cannot uniquely prove V4 fallback versus original/prefill execution.",
             "Nonuniform token/request shapes => prefill_or_dp_padding, not definitive prefill.",
             "Static OP State is not proof of graph replay; no token generation ordinal is inferred.",
+            "Indexer Q and block-table shapes denote capacity, not effective request counts; padding contents are unavailable.",
+            "TPOT pairs never cross layout, capacity or observed ring-mapping regimes.",
+            "Ring remapping requires an ordered validity/modulo/select chain with matching (tokens,1,2048) shapes.",
             "Layer numbers require a complete observed 58-MoE forward; excerpts keep IDs blank.",
             "Layer60 uses observed terminal Add; optional median terminal gap is explicitly estimated.",
             "kernel_sum may exceed wall span under concurrency; interval union avoids double-counting.",
@@ -1133,6 +1239,8 @@ def analyze(path, output_dir, device=None, sep="auto", first_moe=3, moe_count=58
     (out/"decode_summary.txt").write_text(summary_text+"\n", encoding="utf-8")
     print("\n========= Selected layer: observed order =========")
     print(f"Selected layer_uid={target}, origin={selected_kernels.relative_origin.iloc[0]}")
+    print(f"Split capacity={selected_kernels.split_capacity.iloc[0]} (includes padding); effective requests: unknown")
+    print(f"Mapping path: {layers[target]['mapping_signature']}")
     for r in selected_modules.itertuples():
         print(f"{r.module_name:36s} span={r.span_us:10.3f} us; kernel_sum={r.kernel_sum_us:10.3f} us [{r.status}]")
         print("  "+core_profile_text(r._asdict()))
